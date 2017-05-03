@@ -55,3 +55,4 @@ GTAGS
 
 # editor backup files etc.
 \#*\#
+/.vscode

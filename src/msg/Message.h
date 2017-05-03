@@ -16,7 +16,8 @@
 #define CEPH_MESSAGE_H
  
 #include <stdlib.h>
-#include <ostream>
+#include <ostream> 
+//Output stream objects can write sequences of characters and represent other kinds of data
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/intrusive/list.hpp>
