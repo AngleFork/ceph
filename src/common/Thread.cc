@@ -42,8 +42,14 @@ static int _set_affinity(int id)
 
     CPU_SET(id, &cpuset);
 
+    //Set the CPU on which the calling process runs. Let the process running
+    //on a specific CPU helps to avoid unnessesary cost such as context switch
+    //and cache invalidation.
     if (sched_setaffinity(0, sizeof(cpuset), &cpuset) < 0)
       return -errno;
+    //Let the calling thread relinquish the CPU. It seems no need to call this
+    //since after you set affinity, the process will migrate to the specified 
+    //CPU.
     /* guaranteed to take effect immediately */
     sched_yield();
   }
@@ -127,7 +133,7 @@ int Thread::try_create(size_t stacksize)
   int r;
 
   // The child thread will inherit our signal mask.  Set our signal mask to
-  // the set of signals we want to block.  (It's ok to block signals more
+  // the set of signals we want to block.  (It's ok to block more
   // signals than usual for a little while-- they will just be delivered to
   // another thread or delieverd to this thread later.)
   sigset_t old_sigset;
