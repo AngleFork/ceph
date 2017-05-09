@@ -55,7 +55,7 @@ using namespace std;
  *    Incoming messages are associated with an IncomingQueue, and there
  *    is one such queue associated with each Pipe.
  * - DispatchQueue
- *    IncomingQueues get queued in the DIspatchQueue, which is responsible
+ *    IncomingQueues get queued in the DispatchQueue, which is responsible
  *    for doing a round-robin sweep and processing them via a worker thread.
  * - SimpleMessenger
  *    It's the exterior class passed to the external message handler and

@@ -46,7 +46,7 @@ static int set_close_on_exec(int fd)
   if (flags < 0) {
     return errno;
   }
-  if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) {
+  if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) {//Close file descriptor on exec()
     return errno;
   }
   return 0;

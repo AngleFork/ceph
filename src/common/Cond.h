@@ -32,7 +32,7 @@ class Cond {
 
   Mutex *waiter_mutex;
 
-  // don't allow copying.
+  // don't allow copying. 
   void operator=(Cond &C);
   Cond(const Cond &C);
 
