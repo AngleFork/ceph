@@ -35,4 +35,17 @@ ObjectOperation{
         add bl to indata;
     }
 }
+class Objector{
+    Messager *messager; // Network interface.
+    MonClient *monc;
+    Finisher *finisher;
+    OSDMap *osdmap;
+    std::multimap<string, string> crush_location;
+
+    void submit_command(CommandOp *c, ceph_tid_t *ptid);
+    void handle_command_reply(McommandReply *m);
+    void init();
+    void start(const OSDMap *o = nullptr);
+    void shutdown();
+}
 ```
