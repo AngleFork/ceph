@@ -93,7 +93,7 @@ void SafeTimer::timer_thread()
 
       // is the future now?
       if (p->first > now)
-	break;
+	      break;
 
       Context *callback = p->second;
       events.erase(callback);
