@@ -6,6 +6,15 @@ void *Thread::_entry_func(void *arg){
     return r;
 }
 ```
+### Cond
+Conditional variable
+```C++
+pthread_cond_t _c;
+Mutex *waiter_mutex;
+int Wait(Mutex &mutex); // Release lock and wait for events. After waking up
+                        // a lock should be retained.
+int Signal(); // Release lock and wake up waiting threads.
+```
 
 ### Acceptor
 Only accept new connection, pass it to SimpleMessager.
@@ -63,6 +72,62 @@ protected:
     DispatchQueue* in_q;
     list<Message*>sent;
     Cond cond;
+
+    void reader(){
+        if(state == STATE_ACCEPTING){
+            accept();
+        }
+        while(state != STATE_CLOSED && state != STATE_CONNECTING){
+            read message tag
+            if(tag == CEPH_MSGR_TAG_KEEPALIVE){
+                connection_state->set_last_keepalive(ceph_clock_now())
+            }
+            if(tag == CEPH_MSGR_TAG_KEEPALIVE2){
+                connection_state->set_last_keepalive(ceph_clock_now())
+            }
+            if(tag == CEPH_MSGR_TAG_MSG){
+                Message* m = 0;
+                int r = read_message(&m, auth_handler.get());
+            }
+            if(state == STATE_CLOSED || state == STATE_CONNECTING){
+                in_q->dispatch_throttle_release(m->get_dispatch_throttle_size());
+                m->put(); //Drop
+            }
+            if(m->get_seq() <= in_seq){
+                in_q->dispatch_throttle_release(m->get_dispatch_throttle_size());
+                m->put(); //Drop
+            }
+            if(m->get_seq() > in_seq + 1){
+                missed message.
+            }
+            m->set_connection(connection_state.get());
+            in_q->fast_preprocess(m);
+            if(delay_thread){
+                inject_delay.
+                delay_thread->queue(release, m);
+            }else{
+                if(in_q->can_fast_dispatch(m)){
+                    in_q->fast_dispatch();
+                }else{
+                    in_q->enqueue(m, m->get_priority(), conn_id);
+                }
+            }
+        }
+    }
+
+    void writer(){
+        while(state != STATE_CLOSED){
+            handle ACK, reconnecting, closing.
+            Message* m = _get_next_outgoing();
+            if(m){
+                sent.push_back(m);
+            }
+            bufferlist blist = m->get_payload();
+            blist.append(m->get_middle());
+            blist.append(m->get_data());
+            write_message(header, footer, blist);
+        }
+    }
 }
 class Reader{
     Pipe* pipe;
@@ -81,10 +146,24 @@ class Writer{
 class DelayedDelivery{
     Pipe *pipe;
     std::deque<pair<utime_t, Message*>>delay_queue;
-    Mutex delay_lock;
+    Mutex delay_lock;// Guard the other variable.
     Cond delay_cond;
+    void *entry(){
+        while(!stop_delayed_delivery){
+            m = delay_queue.pop_front()
+            if(pipe->in_q->can_fast_dispatch(m)){
+                pipe->in_q->fast_dispatch(m);
+            }else{
+                pipe->in_q->enqueue(m, m->get_priority(), pipe->conn_id)
+            }
+        }
+    }
 }
 ```
+
+### Messager
+
+### Connection
 
 
 

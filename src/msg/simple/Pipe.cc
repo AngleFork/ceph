@@ -275,7 +275,8 @@ void *Pipe::DelayedDelivery::entry()
     if (!flush_count &&
         (release > ceph_clock_now() &&
          (delay_msg_type.empty() || m->get_type_name() == delay_msg_type))) {
-      lgeneric_subdout(pipe->msgr->cct, ms, 10) << *pipe << "DelayedDelivery::entry sleeping on delay_cond until " << release << dendl;
+      lgeneric_subdout(pipe->msgr->cct, ms, 10) << *pipe << 
+      "DelayedDelivery::entry sleeping on delay_cond until " << release << dendl;
       delay_cond.WaitUntil(delay_lock, release);
       continue;
     }
