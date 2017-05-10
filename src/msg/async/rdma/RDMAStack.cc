@@ -52,6 +52,7 @@ RDMADispatcher::RDMADispatcher(CephContext* c, RDMAStack* s)
 
   plb.add_u64_counter(l_msgr_rdma_polling, "polling", "Whether dispatcher thread is polling");
   plb.add_u64_counter(l_msgr_rdma_inflight_tx_chunks, "inflight_tx_chunks", "The number of inflight tx chunks");
+  plb.add_u64_counter(l_msgr_rdma_inqueue_rx_chunks, "inqueue_rx_chunks", "The number of inqueue rx chunks");
 
   plb.add_u64_counter(l_msgr_rdma_tx_total_wc, "tx_total_wc", "The number of tx work comletions");
   plb.add_u64_counter(l_msgr_rdma_tx_total_wc_errors, "tx_total_wc_errors", "The number of tx errors");
@@ -73,8 +74,6 @@ RDMADispatcher::RDMADispatcher(CephContext* c, RDMAStack* s)
 
   perf_logger = plb.create_perf_counters();
   cct->get_perfcounters_collection()->add(perf_logger);
-
-  cct->register_fork_watcher(this);
 }
 
 void RDMADispatcher::polling_start()
@@ -181,8 +180,10 @@ void RDMADispatcher::polling()
         }
       }
 
-      for (auto &&i : polled)
+      for (auto &&i : polled) {
+        perf_logger->inc(l_msgr_rdma_inqueue_rx_chunks, i.second.size());
         i.first->pass_wc(std::move(i.second));
+      }
       polled.clear();
     }
 
@@ -281,26 +282,6 @@ void RDMADispatcher::erase_qpn(uint32_t qpn)
 {
   Mutex::Locker l(lock);
   erase_qpn_lockless(qpn);
-}
-
-void RDMADispatcher::handle_pre_fork()
-{
-  polling_stop();
-  done = false;
-
-  global_infiniband->handle_pre_fork();
-
-  global_infiniband.destroy();
-}
-
-void RDMADispatcher::handle_post_fork()
-{
-  if (!global_infiniband) {
-    global_infiniband.construct(cct);
-    global_infiniband->set_dispatcher(this);
-  }
-
-  polling_start();
 }
 
 void RDMADispatcher::handle_tx_event(Device *ibdev, ibv_wc *cqe, int n)
@@ -410,6 +391,8 @@ void RDMAWorker::initialize()
 
 int RDMAWorker::listen(entity_addr_t &sa, const SocketOptions &opt,ServerSocket *sock)
 {
+  global_infiniband->init();
+
   auto p = new RDMAServerConnTCP(cct, global_infiniband.get(), get_stack()->get_dispatcher(), this, sa);
   int r = p->listen(sa, opt);
   if (r < 0) {
@@ -423,6 +406,8 @@ int RDMAWorker::listen(entity_addr_t &sa, const SocketOptions &opt,ServerSocket 
 
 int RDMAWorker::connect(const entity_addr_t &addr, const SocketOptions &opts, ConnectedSocket *socket)
 {
+  global_infiniband->init();
+
   RDMAConnectedSocketImpl* p = new RDMAConnectedSocketImpl(cct, global_infiniband.get(), get_stack()->get_dispatcher(), this);
   int r = p->try_connect(addr, opts);
 
@@ -507,7 +492,6 @@ RDMAStack::RDMAStack(CephContext *cct, const string &t): NetworkStack(cct, t)
   ldout(cct, 20) << __func__ << " constructing RDMAStack..." << dendl;
   dispatcher = new RDMADispatcher(cct, this);
   global_infiniband->set_dispatcher(dispatcher);
-  dispatcher->polling_start();
 
   unsigned num = get_num_worker();
   for (unsigned i = 0; i < num; ++i) {

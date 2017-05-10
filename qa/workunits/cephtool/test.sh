@@ -7,6 +7,19 @@ set -o functrace
 PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 SUDO=${SUDO:-sudo}
 
+function get_admin_socket()
+{
+  local client=$1
+
+  if test -n "$CEPH_OUT_DIR";
+  then
+    echo $CEPH_OUT_DIR/$client.asok
+  else
+    local cluster=$(echo $CEPH_ARGS | sed  -r 's/.*--cluster[[:blank:]]*([[:alnum:]]*).*/\1/')
+    echo "/var/run/ceph/$cluster-$client.asok"
+  fi
+}
+
 function check_no_osd_down()
 {
     ! ceph osd dump | grep ' down '
@@ -381,6 +394,7 @@ function test_tiering()
 
   # make sure we can't create an ec pool tier
   ceph osd pool create eccache 2 2 erasure
+  expect_false ceph osd set-require-min-compat-client bobtail
   ceph osd pool create repbase 2
   expect_false ceph osd tier add repbase eccache
   ceph osd pool delete repbase repbase --yes-i-really-really-mean-it
@@ -986,6 +1000,20 @@ function test_mon_mds()
 
   fail_all_mds $FS_NAME
   ceph fs rm $FS_NAME --yes-i-really-mean-it
+
+  # We should be permitted to use an EC pool with overwrites enabled
+  # as the data pool...
+  ceph osd pool set mds-ec-pool allow_ec_overwrites true
+  ceph fs new $FS_NAME fs_metadata mds-ec-pool --force 2>$TMPFILE
+  fail_all_mds $FS_NAME
+  ceph fs rm $FS_NAME --yes-i-really-mean-it
+
+  # ...but not as the metadata pool
+  set +e
+  ceph fs new $FS_NAME mds-ec-pool fs_data 2>$TMPFILE
+  check_response 'erasure-code' $? 22
+  set -e
+
   ceph osd pool delete mds-ec-pool mds-ec-pool --yes-i-really-really-mean-it
 
   # Create a FS and check that we can subsequently add a cache tier to it
@@ -1006,6 +1034,8 @@ function test_mon_mds()
   # Clean up FS
   fail_all_mds $FS_NAME
   ceph fs rm $FS_NAME --yes-i-really-mean-it
+
+
 
   ceph mds stat
   # ceph mds tell mds.a getmap
@@ -1102,6 +1132,12 @@ function test_mon_osd()
   ceph osd crush get-tunable straw_calc_version | grep 0
   ceph osd crush set-tunable straw_calc_version 1
   ceph osd crush get-tunable straw_calc_version | grep 1
+
+  #
+  # require-min-compat-client
+  expect_false ceph osd set-require-min-compat-client dumpling  # firefly tunables
+  ceph osd set-require-min-compat-client luminous
+  ceph osd dump | grep 'require_min_compat_client luminous'
 
   #
   # osd scrub
@@ -1304,7 +1340,19 @@ function test_mon_osd_pool()
   # should fail because the type is not the same
   expect_false ceph osd pool create replicated 12 12 erasure
   ceph osd lspools | grep replicated
+  ceph osd pool create ec_test 1 1 erasure
+  set +e
+  ceph osd metadata | grep osd_objectstore_type | grep -qc bluestore
+  if [ $? -eq 0 ]; then
+      ceph osd pool set ec_test allow_ec_overwrites true >& $TMPFILE
+      check_response $? 22 "pool must only be stored on bluestore for scrubbing to work"
+  else
+      ceph osd pool set ec_test allow_ec_overwrites true || return 1
+      expect_false ceph osd pool set ec_test allow_ec_overwrites false
+  fi
+  set -e
   ceph osd pool delete replicated replicated --yes-i-really-really-mean-it
+  ceph osd pool delete ec_test ec_test --yes-i-really-really-mean-it
 }
 
 function test_mon_osd_pool_quota()
@@ -1355,6 +1403,9 @@ function test_mon_osd_pool_quota()
 
 function test_mon_pg()
 {
+  # Make sure we start healthy.
+  wait_for_health_ok
+
   ceph pg debug unfound_objects_exist
   ceph pg debug degraded_pgs_exist
   ceph pg deep-scrub 0.0
@@ -1403,8 +1454,37 @@ function test_mon_pg()
 
   ceph osd set-full-ratio .962
   ceph osd dump | grep '^full_ratio 0.962'
+  ceph osd set-backfillfull-ratio .912
+  ceph osd dump | grep '^backfillfull_ratio 0.912'
   ceph osd set-nearfull-ratio .892
   ceph osd dump | grep '^nearfull_ratio 0.892'
+
+  # Check health status
+  ceph osd set-nearfull-ratio .913
+  ceph health | grep 'HEALTH_ERR.*Full ratio(s) out of order'
+  ceph health detail | grep 'backfillfull_ratio (0.912) < nearfull_ratio (0.913), increased'
+  ceph osd set-nearfull-ratio .892
+  ceph osd set-backfillfull-ratio .963
+  ceph health detail | grep 'full_ratio (0.962) < backfillfull_ratio (0.963), increased'
+  ceph osd set-backfillfull-ratio .912
+
+  # Check injected full results
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.0) injectfull nearfull
+  wait_for_health "HEALTH_WARN.*1 nearfull osd(s)"
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.1) injectfull backfillfull
+  wait_for_health "HEALTH_WARN.*1 backfillfull osd(s)"
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.2) injectfull failsafe
+  # failsafe and full are the same as far as the monitor is concerned
+  wait_for_health "HEALTH_ERR.*1 full osd(s)"
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.0) injectfull full
+  wait_for_health "HEALTH_ERR.*2 full osd(s)"
+  ceph health detail | grep "osd.0 is full at.*%"
+  ceph health detail | grep "osd.2 is full at.*%"
+  ceph health detail | grep "osd.1 is backfill full at.*%"
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.0) injectfull none
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.1) injectfull none
+  $SUDO ceph --admin-daemon $(get_admin_socket osd.2) injectfull none
+  wait_for_health_ok
 
   ceph pg stat | grep 'pgs:'
   ceph pg 0.0 query
@@ -1740,12 +1820,12 @@ function test_admin_heap_profiler()
 
   [[ $do_test -eq 0 ]] && return 0
 
-  admin_socket = "--admin-daemon out/osd.0.asok"
+  local admin_socket=$(get_admin_socket osd.0)
 
-  ceph --admin $admin_socket heap start_profiler
-  ceph --admin $admin_socket heap dump
-  ceph --admin $admin_socket heap stop_profiler
-  ceph --admin $admin_socket heap release
+  $SUDO ceph --admin-daemon $admin_socket heap start_profiler
+  $SUDO ceph --admin-daemon $admin_socket heap dump
+  $SUDO ceph --admin-daemon $admin_socket heap stop_profiler
+  $SUDO ceph --admin-daemon $admin_socket heap release
 }
 
 function test_osd_bench()
@@ -1973,6 +2053,7 @@ MON_TESTS+=" mon_cephdf_commands"
 OSD_TESTS+=" osd_bench"
 OSD_TESTS+=" osd_negative_filestore_merge_threshold"
 OSD_TESTS+=" tiering_agent"
+OSD_TESTS+=" admin_heap_profiler"
 
 MDS_TESTS+=" mds_tell"
 MDS_TESTS+=" mon_mds"

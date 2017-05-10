@@ -54,6 +54,7 @@ protected:
 
   Messenger *msgr;
   MonClient *monc;
+  Finisher  &finisher;
   DaemonStateIndex &daemon_state;
   ClusterState &cluster_state;
   PyModules &py_modules;
@@ -73,6 +74,11 @@ protected:
     const map<string,string>& param_str_map,
     const MgrCommand *this_cmd);
 
+private:
+  friend class ReplyOnFinish;
+  bool _reply(MCommand* m,
+	      int ret, const std::string& s, const bufferlist& payload);
+
 public:
   int init(uint64_t gid, entity_addr_t client_addr);
   void shutdown();
@@ -80,6 +86,7 @@ public:
   entity_addr_t get_myaddr() const;
 
   DaemonServer(MonClient *monc_,
+               Finisher &finisher_,
 	       DaemonStateIndex &daemon_state_,
 	       ClusterState &cluster_state_,
 	       PyModules &py_modules_,

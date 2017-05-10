@@ -38,6 +38,9 @@ class TestCephDisk(object):
         main.setup_logging(verbose=True, log_stdout=False)
 
     def test_main_list_json(self, capsys):
+        if platform.system() == "FreeBSD":
+            return
+
         data = tempfile.mkdtemp()
         main.setup_statedir(data)
         args = main.parse_args(['list', '--format', 'json'])
@@ -50,6 +53,9 @@ class TestCephDisk(object):
         shutil.rmtree(data)
 
     def test_main_list_plain(self, capsys):
+        if platform.system() == "FreeBSD":
+            return
+
         data = tempfile.mkdtemp()
         main.setup_statedir(data)
         args = main.parse_args(['list'])
@@ -267,6 +273,9 @@ class TestCephDisk(object):
                     'state': 'prepared'} == desc
 
     def test_list_all_partitions(self):
+        if platform.system() == "FreeBSD":
+            return
+
         disk = "Xda"
         partition = "Xda1"
 
@@ -456,6 +465,9 @@ class TestCephDisk(object):
                   main.PTYPE['regular']['journal']['ready'])
 
     def test_list_bluestore(self):
+        if platform.system() == "FreeBSD":
+            return
+
         self.list(main.PTYPE['plain']['osd']['ready'],
                   main.PTYPE['plain']['block']['ready'])
         self.list(main.PTYPE['luks']['osd']['ready'],
@@ -1306,6 +1318,9 @@ class TestCephDiskDeactivateAndDestroy(unittest.TestCase):
                               cluster, osd_id)
 
     def test_main_fix(self):
+        if platform.system() == "FreeBSD":
+            return
+
         args = main.parse_args(['fix', '--all', '--selinux', '--permissions'])
         commands = []
 

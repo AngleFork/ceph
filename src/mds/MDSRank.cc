@@ -287,6 +287,10 @@ void MDSRankDispatcher::shutdown()
 
   purge_queue.shutdown();
 
+  mds_lock.Unlock();
+  finisher->stop(); // no flushing
+  mds_lock.Lock();
+
   if (objecter->initialized.read())
     objecter->shutdown();
 
@@ -299,8 +303,6 @@ void MDSRankDispatcher::shutdown()
   // release mds_lock for finisher/messenger threads (e.g.
   // MDSDaemon::ms_handle_reset called from Messenger).
   mds_lock.Unlock();
-
-  finisher->stop(); // no flushing
 
   // shut down messenger
   messenger->shutdown();
@@ -1036,8 +1038,42 @@ void MDSRank::boot_start(BootStep step, int r)
       break;
     case MDS_BOOT_REPLAY_DONE:
       assert(is_any_replay());
+
+      // Sessiontable and inotable should be in sync after replay, validate
+      // that they are consistent.
+      validate_sessions();
+
       replay_done();
       break;
+  }
+}
+
+void MDSRank::validate_sessions()
+{
+  assert(mds_lock.is_locked_by_me());
+  std::vector<Session*> victims;
+
+  // Identify any sessions which have state inconsistent with other,
+  // after they have been loaded from rados during startup.
+  // Mitigate bugs like: http://tracker.ceph.com/issues/16842
+  const auto &sessions = sessionmap.get_sessions();
+  for (const auto &i : sessions) {
+    Session *session = i.second;
+    interval_set<inodeno_t> badones;
+    if (inotable->intersects_free(session->info.prealloc_inos, &badones)) {
+      clog->error() << "Client session loaded with invalid preallocated "
+                          "inodes, evicting session " << *session;
+
+      // Make the session consistent with inotable so that it can
+      // be cleanly torn down
+      session->info.prealloc_inos.subtract(badones);
+
+      victims.push_back(session);
+    }
+  }
+
+  for (const auto &session: victims) {
+    server->kill_session(session, nullptr);
   }
 }
 
@@ -1760,13 +1796,18 @@ bool MDSRankDispatcher::handle_asok_command(
   } else if (command == "session evict") {
     std::string client_id;
     const bool got_arg = cmd_getval(g_ceph_context, cmdmap, "client_id", client_id);
-    assert(got_arg == true);
+    if(!got_arg) {
+      ss << "Invalid client_id specified";
+      return true;
+    }
 
     mds_lock.Lock();
-    std::stringstream ss;
-    bool killed = kill_session(strtol(client_id.c_str(), 0, 10), true, ss);
-    if (!killed)
-      dout(15) << ss.str() << dendl;
+    stringstream dss;
+    bool killed = kill_session(strtol(client_id.c_str(), 0, 10), true, dss);
+    if (!killed) {
+      dout(15) << dss.str() << dendl;
+      ss << dss.str();
+    }
     mds_lock.Unlock();
   } else if (command == "scrub_path") {
     string path;
@@ -2388,43 +2429,60 @@ void MDSRank::create_logger()
   {
     PerfCountersBuilder mds_plb(g_ceph_context, "mds", l_mds_first, l_mds_last);
 
-    mds_plb.add_u64_counter(l_mds_request, "request", "Requests");
+    mds_plb.add_u64_counter(
+      l_mds_request, "request", "Requests", "req",
+      PerfCountersBuilder::PRIO_CRITICAL);
     mds_plb.add_u64_counter(l_mds_reply, "reply", "Replies");
-    mds_plb.add_time_avg(l_mds_reply_latency, "reply_latency",
-        "Reply latency", "rlat");
-    mds_plb.add_u64_counter(l_mds_forward, "forward", "Forwarding request");
-
+    mds_plb.add_time_avg(
+      l_mds_reply_latency, "reply_latency", "Reply latency", "rlat",
+      PerfCountersBuilder::PRIO_CRITICAL);
+    mds_plb.add_u64_counter(
+      l_mds_forward, "forward", "Forwarding request", "fwd",
+      PerfCountersBuilder::PRIO_INTERESTING);
     mds_plb.add_u64_counter(l_mds_dir_fetch, "dir_fetch", "Directory fetch");
     mds_plb.add_u64_counter(l_mds_dir_commit, "dir_commit", "Directory commit");
     mds_plb.add_u64_counter(l_mds_dir_split, "dir_split", "Directory split");
     mds_plb.add_u64_counter(l_mds_dir_merge, "dir_merge", "Directory merge");
 
     mds_plb.add_u64(l_mds_inode_max, "inode_max", "Max inodes, cache size");
-    mds_plb.add_u64(l_mds_inodes, "inodes", "Inodes", "inos");
+    mds_plb.add_u64(l_mds_inodes, "inodes", "Inodes", "inos",
+		    PerfCountersBuilder::PRIO_CRITICAL);
     mds_plb.add_u64(l_mds_inodes_top, "inodes_top", "Inodes on top");
     mds_plb.add_u64(l_mds_inodes_bottom, "inodes_bottom", "Inodes on bottom");
-    mds_plb.add_u64(l_mds_inodes_pin_tail, "inodes_pin_tail", "Inodes on pin tail");
+    mds_plb.add_u64(
+      l_mds_inodes_pin_tail, "inodes_pin_tail", "Inodes on pin tail");
     mds_plb.add_u64(l_mds_inodes_pinned, "inodes_pinned", "Inodes pinned");
     mds_plb.add_u64(l_mds_inodes_expired, "inodes_expired", "Inodes expired");
-    mds_plb.add_u64(l_mds_inodes_with_caps, "inodes_with_caps", "Inodes with capabilities");
-    mds_plb.add_u64(l_mds_caps, "caps", "Capabilities", "caps");
+    mds_plb.add_u64(
+      l_mds_inodes_with_caps, "inodes_with_caps", "Inodes with capabilities");
+    mds_plb.add_u64(l_mds_caps, "caps", "Capabilities", "caps",
+		    PerfCountersBuilder::PRIO_INTERESTING);
     mds_plb.add_u64(l_mds_subtrees, "subtrees", "Subtrees");
 
     mds_plb.add_u64_counter(l_mds_traverse, "traverse", "Traverses");
     mds_plb.add_u64_counter(l_mds_traverse_hit, "traverse_hit", "Traverse hits");
-    mds_plb.add_u64_counter(l_mds_traverse_forward, "traverse_forward", "Traverse forwards");
-    mds_plb.add_u64_counter(l_mds_traverse_discover, "traverse_discover", "Traverse directory discovers");
-    mds_plb.add_u64_counter(l_mds_traverse_dir_fetch, "traverse_dir_fetch", "Traverse incomplete directory content fetchings");
-    mds_plb.add_u64_counter(l_mds_traverse_remote_ino, "traverse_remote_ino", "Traverse remote dentries");
-    mds_plb.add_u64_counter(l_mds_traverse_lock, "traverse_lock", "Traverse locks");
+    mds_plb.add_u64_counter(l_mds_traverse_forward, "traverse_forward",
+			    "Traverse forwards");
+    mds_plb.add_u64_counter(l_mds_traverse_discover, "traverse_discover",
+			    "Traverse directory discovers");
+    mds_plb.add_u64_counter(l_mds_traverse_dir_fetch, "traverse_dir_fetch",
+			    "Traverse incomplete directory content fetchings");
+    mds_plb.add_u64_counter(l_mds_traverse_remote_ino, "traverse_remote_ino",
+			    "Traverse remote dentries");
+    mds_plb.add_u64_counter(l_mds_traverse_lock, "traverse_lock",
+			    "Traverse locks");
 
     mds_plb.add_u64(l_mds_load_cent, "load_cent", "Load per cent");
     mds_plb.add_u64(l_mds_dispatch_queue_len, "q", "Dispatch queue length");
 
     mds_plb.add_u64_counter(l_mds_exported, "exported", "Exports");
-    mds_plb.add_u64_counter(l_mds_exported_inodes, "exported_inodes", "Exported inodes");
+    mds_plb.add_u64_counter(
+      l_mds_exported_inodes, "exported_inodes", "Exported inodes", "exi",
+      PerfCountersBuilder::PRIO_INTERESTING);
     mds_plb.add_u64_counter(l_mds_imported, "imported", "Imports");
-    mds_plb.add_u64_counter(l_mds_imported_inodes, "imported_inodes", "Imported inodes");
+    mds_plb.add_u64_counter(
+      l_mds_imported_inodes, "imported_inodes", "Imported inodes", "imi",
+      PerfCountersBuilder::PRIO_INTERESTING);
     logger = mds_plb.create_perf_counters();
     g_ceph_context->get_perfcounters_collection()->add(logger);
   }
@@ -2571,7 +2629,7 @@ bool MDSRankDispatcher::handle_command(
       return true;
     }
 
-    Formatter *f = new JSONFormatter();
+    Formatter *f = new JSONFormatter(true);
     dump_sessions(filter, f);
     f->flush(*ds);
     delete f;
@@ -2591,7 +2649,7 @@ bool MDSRankDispatcher::handle_command(
     *need_reply = false;
     return true;
   } else if (prefix == "damage ls") {
-    Formatter *f = new JSONFormatter();
+    Formatter *f = new JSONFormatter(true);
     damage_table.dump(f);
     f->flush(*ds);
     delete f;

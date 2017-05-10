@@ -267,6 +267,13 @@ public:
   RGWOpType get_type() override { return RGW_OP_GET_OBJ; }
   uint32_t op_mask() override { return RGW_OP_TYPE_READ; }
   virtual bool need_object_expiration() { return false; }
+  /**
+   * calculates filter used to decrypt RGW objects data
+   */
+  virtual int get_decrypt_filter(std::unique_ptr<RGWGetDataCB>* filter, RGWGetDataCB* cb, bufferlist* manifest_bl) {
+    *filter = nullptr;
+    return 0;
+  }
 };
 
 class RGWGetObj_CB : public RGWGetDataCB
@@ -306,8 +313,8 @@ public:
   /**
    * Allows filter to extend range required for successful filtering
    */
-  void fixup_range(off_t& ofs, off_t& end) override {
-    next->fixup_range(ofs, end);
+  int fixup_range(off_t& ofs, off_t& end) override {
+    return next->fixup_range(ofs, end);
   }
 };
 
@@ -420,6 +427,9 @@ protected:
 
   boost::optional<std::pair<std::string, rgw_obj_key>>
   parse_path(const boost::string_ref& path);
+  
+  std::pair<std::string, std::string>
+  handle_upload_path(struct req_state *s);
 
   bool handle_file_verify_permission(RGWBucketInfo& binfo,
                                      std::map<std::string, ceph::bufferlist>& battrs,
@@ -918,6 +928,8 @@ protected:
   uint64_t olh_epoch;
   string version_id;
   bufferlist bl_aux;
+  map<string, string> crypt_http_responses;
+  string user_data;
 
   boost::optional<ceph::real_time> delete_at;
 
@@ -956,6 +968,19 @@ public:
   void pre_exec() override;
   void execute() override;
 
+  /* this is for cases when copying data from other object */
+  virtual int get_decrypt_filter(std::unique_ptr<RGWGetDataCB>* filter,
+                                 RGWGetDataCB* cb,
+                                 map<string, bufferlist>& attrs,
+                                 bufferlist* manifest_bl) {
+    *filter = nullptr;
+    return 0;
+  }
+  virtual int get_encrypt_filter(std::unique_ptr<RGWPutObjDataProcessor> *filter, RGWPutObjDataProcessor* cb) {
+     *filter = nullptr;
+     return 0;
+  }
+
   int get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len);
   int get_data(const off_t fst, const off_t lst, bufferlist& bl);
 
@@ -992,21 +1017,23 @@ protected:
   const char *supplied_md5_b64;
   const char *supplied_etag;
   string etag;
-  string boundary;
-  bool data_pending;
-  string content_type;
   RGWAccessControlPolicy policy;
   map<string, bufferlist> attrs;
   boost::optional<ceph::real_time> delete_at;
 
+  /* Must be called after get_data() or the result is undefined. */
+  virtual std::string get_current_filename() const = 0;
+  virtual std::string get_current_content_type() const = 0;
+  virtual bool is_next_file_to_upload() {
+     return false;
+  }
 public:
   RGWPostObj() : min_len(0),
                  max_len(LLONG_MAX),
                  len(0),
                  ofs(0),
                  supplied_md5_b64(nullptr),
-                 supplied_etag(nullptr),
-                 data_pending(false) {
+                 supplied_etag(nullptr) {
   }
 
   void emplace_attr(std::string&& key, buffer::list&& bl) {
@@ -1022,10 +1049,14 @@ public:
   void pre_exec() override;
   void execute() override;
 
+  virtual int get_encrypt_filter(std::unique_ptr<RGWPutObjDataProcessor> *filter, RGWPutObjDataProcessor* cb) {
+    *filter = nullptr;
+    return 0;
+  }
   virtual int get_params() = 0;
-  virtual int get_data(bufferlist& bl) = 0;
+  virtual int get_data(ceph::bufferlist& bl, bool& again) = 0;
   void send_response() override = 0;
-  const string name() override { return "post_obj"; }
+  const std::string name() override { return "post_obj"; }
   RGWOpType get_type() override { return RGW_OP_POST_OBJ; }
   uint32_t op_mask() override { return RGW_OP_TYPE_WRITE; }
 };
@@ -1073,6 +1104,7 @@ protected:
   map<string, buffer::list> attrs;
   set<string> rmattr_names;
   bool has_policy, has_cors;
+  uint32_t policy_rw_mask;
   RGWAccessControlPolicy policy;
   RGWCORSConfiguration cors_config;
   string placement_rule;
@@ -1080,7 +1112,7 @@ protected:
 
 public:
   RGWPutMetadataBucket()
-    : has_policy(false), has_cors(false)
+    : has_policy(false), has_cors(false), policy_rw_mask(0)
   {}
 
   void emplace_attr(std::string&& key, buffer::list&& bl) {
@@ -1487,6 +1519,7 @@ public:
   const string name() override { return "init_multipart"; }
   RGWOpType get_type() override { return RGW_OP_INIT_MULTIPART; }
   uint32_t op_mask() override { return RGW_OP_TYPE_WRITE; }
+  virtual int prepare_encryption(map<string, bufferlist>& attrs) { return 0; }
 };
 
 class RGWCompleteMultipart : public RGWOp {
@@ -1707,7 +1740,7 @@ static inline int put_data_and_throttle(RGWPutObjDataProcessor *processor,
 {
   bool again = false;
   do {
-    void *handle;
+    void *handle = nullptr;
     rgw_raw_obj obj;
 
     uint64_t size = data.length();
@@ -1715,17 +1748,24 @@ static inline int put_data_and_throttle(RGWPutObjDataProcessor *processor,
     int ret = processor->handle_data(data, ofs, &handle, &obj, &again);
     if (ret < 0)
       return ret;
-
-    ret = processor->throttle_data(handle, obj, size, need_to_wait);
-    if (ret < 0)
-      return ret;
-
+    if (handle != nullptr)
+    {
+      ret = processor->throttle_data(handle, obj, size, need_to_wait);
+      if (ret < 0)
+        return ret;
+    }
+    else
+      break;
     need_to_wait = false; /* the need to wait only applies to the first
 			   * iteration */
   } while (again);
 
   return 0;
 } /* put_data_and_throttle */
+
+
+
+
 
 static inline int get_system_versioning_params(req_state *s,
 					      uint64_t *olh_epoch,
@@ -1788,11 +1828,19 @@ static inline void rgw_get_request_metadata(CephContext *cct,
 					    map<string, bufferlist>& attrs,
 					    const bool allow_empty_attrs = true)
 {
+  static const std::set<std::string> blacklisted_headers = {
+      "x-amz-server-side-encryption-customer-algorithm",
+      "x-amz-server-side-encryption-customer-key",
+      "x-amz-server-side-encryption-customer-key-md5"
+  };
   map<string, string>::iterator iter;
   for (iter = info.x_meta_map.begin(); iter != info.x_meta_map.end(); ++iter) {
     const string &name(iter->first);
     string &xattr(iter->second);
-
+    if (blacklisted_headers.count(name) == 1) {
+      lsubdout(cct, rgw, 10) << "skipping x>> " << name << dendl;
+      continue;
+    }
     if (allow_empty_attrs || !xattr.empty()) {
       lsubdout(cct, rgw, 10) << "x>> " << name << ":" << xattr << dendl;
       format_xattr(xattr);

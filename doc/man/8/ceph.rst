@@ -13,7 +13,7 @@ Synopsis
 
 | **ceph** **compact**
 
-| **ceph** **config-key** [ *del* | *exists* | *get* | *list* | *put* ] ...
+| **ceph** **config-key** [ *del* | *exists* | *get* | *list* | *dump* | *put* ] ...
 
 | **ceph** **daemon** *<name>* \| *<path>* *<command>* ...
 
@@ -39,7 +39,7 @@ Synopsis
 
 | **ceph** **mon_status**
 
-| **ceph** **osd** [ *blacklist* \| *blocked-by* \| *create* \| *deep-scrub* \| *df* \| *down* \| *dump* \| *erasure-code-profile* \| *find* \| *getcrushmap* \| *getmap* \| *getmaxosd* \| *in* \| *lspools* \| *map* \| *metadata* \| *out* \| *pause* \| *perf* \| *pg-temp* \| *primary-affinity* \| *primary-temp* \| *repair* \| *reweight* \| *reweight-by-pg* \| *rm* \| *scrub* \| *set* \| *setcrushmap* \| *setmaxosd*  \| *stat* \| *thrash* \| *tree* \| *unpause* \| *unset* ] ...
+| **ceph** **osd** [ *blacklist* \| *blocked-by* \| *create* \| *deep-scrub* \| *df* \| *down* \| *dump* \| *erasure-code-profile* \| *find* \| *getcrushmap* \| *getmap* \| *getmaxosd* \| *in* \| *lspools* \| *map* \| *metadata* \| *out* \| *pause* \| *perf* \| *pg-temp* \| *primary-affinity* \| *primary-temp* \| *repair* \| *reweight* \| *reweight-by-pg* \| *rm* \| *scrub* \| *set* \| *setcrushmap* \| *setmaxosd*  \| *stat* \| *tree* \| *unpause* \| *unset* ] ...
 
 | **ceph** **osd** **crush** [ *add* \| *add-bucket* \| *create-or-move* \| *dump* \| *get-tunable* \| *link* \| *move* \| *remove* \| *rename-bucket* \| *reweight* \| *reweight-all* \| *reweight-subtree* \| *rm* \| *rule* \| *set* \| *set-tunable* \| *show-tunables* \| *tunables* \| *unlink* ] ...
 
@@ -201,7 +201,13 @@ Usage::
 
 	ceph config-key list
 
-Subcommand ``put`` puts configuration key and values.
+Subcommand ``dump`` dumps configuration keys and values.
+
+Usage::
+
+	ceph config-key dump
+
+Subcommand ``put`` puts configuration key and value.
 
 Usage::
 
@@ -1165,6 +1171,12 @@ Subcommand ``set_full_ratio`` sets ratio at which pgs are considered full.
 Usage::
 
 	ceph pg set_full_ratio <float[0.0-1.0]>
+
+Subcommand ``set_backfillfull_ratio`` sets ratio at which pgs are considered too full to backfill.
+
+Usage::
+
+	ceph pg set_backfillfull_ratio <float[0.0-1.0]>
 
 Subcommand ``set_nearfull_ratio`` sets ratio at which pgs are considered nearly
 full.

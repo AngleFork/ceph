@@ -98,6 +98,8 @@
 
 #include "common/Timer.h"
 
+#include "perfglue/heap_profiler.h"
+
 using namespace std;
 
 #include "common/config.h"
@@ -657,6 +659,7 @@ void MDCache::populate_mydir()
   }
 
   // open or create stray
+  uint64_t num_strays = 0;
   for (int i = 0; i < NUM_STRAY; ++i) {
     stringstream name;
     name << "stray" << i;
@@ -699,8 +702,13 @@ void MDCache::populate_mydir()
         dir->fetch(new C_MDS_RetryOpenRoot(this));
         return;
       }
+
+      if (dir->get_frag_size() > 0)
+	num_strays += dir->get_frag_size();
     }
   }
+
+  stray_manager.set_num_strays(num_strays);
 
   // okay!
   dout(10) << "populate_mydir done" << dendl;
@@ -741,11 +749,6 @@ CDentry *MDCache::get_or_create_stray_dentry(CInode *in)
   } else {
     assert(straydn->get_projected_linkage()->is_null());
   }
-
-  // Notify even if a null dentry already existed, because
-  // StrayManager counts the number of stray inodes, not the
-  // number of dentries in the directory.
-  stray_manager.notify_stray_created();
 
   straydn->state_set(CDentry::STATE_STRAY);
   return straydn;
@@ -7374,11 +7377,11 @@ void MDCache::check_memory_usage()
         g_conf->mds_cache_size * g_conf->mds_health_cache_threshold) {
     // Only do this once we are back in bounds: otherwise the releases would
     // slow down whatever process caused us to exceed bounds to begin with
-    dout(2) << "check_memory_usage: releasing unused space from pool allocators"
-            << dendl;
-    CInode::pool.release_memory();
-    CDir::pool.release_memory();
-    CDentry::pool.release_memory();
+    if (ceph_using_tcmalloc()) {
+      dout(2) << "check_memory_usage: releasing unused space from tcmalloc" 
+	      << dendl;
+      ceph_heap_release_free_memory();
+    }
     exceeded_size_limit = false;
   }
 }
@@ -8178,8 +8181,16 @@ void MDCache::_open_remote_dentry_finish(CDentry *dn, inodeno_t ino, MDSInternal
   if (r < 0) {
       dout(0) << "open_remote_dentry_finish bad remote dentry " << *dn << dendl;
       dn->state_set(CDentry::STATE_BADREMOTEINO);
+
+      std::string path;
+      CDir *dir = dn->get_dir();
+      if (dir) {
+        dir->get_inode()->make_path_string(path);
+        path =  path + "/" + dn->get_name();
+      }
+
       bool fatal = mds->damage_table.notify_remote_damaged(
-          dn->get_projected_linkage()->get_remote_ino());
+          dn->get_projected_linkage()->get_remote_ino(), path);
       if (fatal) {
         mds->damaged();
         ceph_abort();  // unreachable, damaged() respawns us
@@ -9389,7 +9400,6 @@ void MDCache::scan_stray_dir(dirfrag_t next)
     for (CDir::map_t::iterator q = dir->items.begin(); q != dir->items.end(); ++q) {
       CDentry *dn = q->second;
       dn->state_set(CDentry::STATE_STRAY);
-      stray_manager.notify_stray_created();
       CDentry::linkage_t *dnl = dn->get_projected_linkage();
       if (dnl->is_primary()) {
 	CInode *in = dnl->get_inode();
@@ -12274,6 +12284,21 @@ void MDCache::register_perfcounters()
     g_ceph_context->get_perfcounters_collection()->add(logger.get());
     recovery_queue.set_logger(logger.get());
     stray_manager.set_logger(logger.get());
+}
+
+void MDCache::activate_stray_manager()
+{
+  if (open) {
+    stray_manager.activate();
+  } else {
+    wait_for_open(
+	new MDSInternalContextWrapper(mds,
+	  new FunctionContext([this](int r){
+	    stray_manager.activate();
+	    })
+	  )
+	);
+  }
 }
 
 /**

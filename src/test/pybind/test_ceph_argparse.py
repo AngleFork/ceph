@@ -183,21 +183,6 @@ class TestPG(TestArgparse):
     def test_force_create_pg(self):
         self.one_pgid('force_create_pg')
 
-    def set_ratio(self, command):
-        self.assert_valid_command(['pg',
-                                   command,
-                                   '0.0'])
-        assert_equal({}, validate_command(sigdict, ['pg', command]))
-        assert_equal({}, validate_command(sigdict, ['pg',
-                                                    command,
-                                                    '2.0']))
-
-    def test_set_full_ratio(self):
-        self.set_ratio('set_full_ratio')
-
-    def test_set_nearfull_ratio(self):
-        self.set_ratio('set_nearfull_ratio')
-
 
 class TestAuth(TestArgparse):
 
@@ -1153,6 +1138,24 @@ class TestOSD(TestArgparse):
                                                     'poolname',
                                                     'toomany']))
 
+    def set_ratio(self, command):
+        self.assert_valid_command(['osd',
+                                   command,
+                                   '0.0'])
+        assert_equal({}, validate_command(sigdict, ['osd', command]))
+        assert_equal({}, validate_command(sigdict, ['osd',
+                                                    command,
+                                                    '2.0']))
+
+    def test_set_full_ratio(self):
+        self.set_ratio('set-full-ratio')
+
+    def test_set_backfillfull_ratio(self):
+        self.set_ratio('set-backfillfull-ratio')
+
+    def test_set_nearfull_ratio(self):
+        self.set_ratio('set-nearfull-ratio')
+
 
 class TestConfigKey(TestArgparse):
 
@@ -1174,6 +1177,9 @@ class TestConfigKey(TestArgparse):
 
     def test_exists(self):
         self.check_1_string_arg('config-key', 'exists')
+
+    def test_dump(self):
+        self.check_no_arg('config-key', 'dump')
 
     def test_list(self):
         self.check_no_arg('config-key', 'list')

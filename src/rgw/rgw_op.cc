@@ -43,6 +43,7 @@
 
 #include "compressor/Compressor.h"
 
+#include "rgw_acl_swift.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -55,7 +56,9 @@ using ceph::crypto::MD5;
 static string mp_ns = RGW_OBJ_NS_MULTIPART;
 static string shadow_ns = RGW_OBJ_NS_SHADOW;
 
-static int forward_request_to_master(struct req_state *s, obj_version *objv, RGWRados *store, bufferlist& in_data, JSONParser *jp);
+static void forward_req_info(CephContext *cct, req_info& info, const std::string& bucket_name);
+static int forward_request_to_master(struct req_state *s, obj_version *objv, RGWRados *store,
+                                     bufferlist& in_data, JSONParser *jp, req_info *forward_info = nullptr);
 
 static MultipartMetaFilter mp_filter;
 
@@ -361,7 +364,7 @@ int rgw_build_bucket_policies(RGWRados* store, struct req_state* s)
   int ret = 0;
   rgw_obj_key obj;
   RGWUserInfo bucket_owner_info;
-  RGWObjectCtx& obj_ctx = *static_cast<RGWObjectCtx *>(s->obj_ctx);
+  RGWObjectCtx obj_ctx(store);
 
   string bi = s->info.args.get(RGW_SYS_PARAM_PREFIX "bucket-instance");
   if (!bi.empty()) {
@@ -374,8 +377,13 @@ int rgw_build_bucket_policies(RGWRados* store, struct req_state* s)
   if(s->dialect.compare("s3") == 0) {
     s->bucket_acl = new RGWAccessControlPolicy_S3(s->cct);
   } else if(s->dialect.compare("swift")  == 0) {
-    s->user_acl = std::unique_ptr<RGWAccessControlPolicy>(
-        new RGWAccessControlPolicy_SWIFTAcct(s->cct));
+    /* We aren't allocating the account policy for those operations using
+     * the Swift's infrastructure that don't really need req_state::user.
+     * Typical example here is the implementation of /info. */
+    if (!s->user->user_id.empty()) {
+      s->user_acl = std::unique_ptr<RGWAccessControlPolicy>(
+          new RGWAccessControlPolicy_SWIFTAcct(s->cct));
+    }
     s->bucket_acl = new RGWAccessControlPolicy_SWIFT(s->cct);
   } else {
     s->bucket_acl = new RGWAccessControlPolicy(s->cct);
@@ -1351,6 +1359,7 @@ void RGWGetObj::execute()
   RGWGetObj_CB cb(this);
   RGWGetDataCB* filter = (RGWGetDataCB*)&cb;
   boost::optional<RGWGetObj_Decompress> decompress;
+  std::unique_ptr<RGWGetDataCB> decrypt;
   map<string, bufferlist>::iterator attr_iter;
 
   perfcounter->inc(l_rgw_get);
@@ -1415,11 +1424,10 @@ void RGWGetObj::execute()
     goto done_err;
   }
   if (need_decompress) {
-    s->obj_size = cs_info.orig_size;
-    decompress.emplace(s->cct, &cs_info, partial_content, filter);
-    filter = &*decompress;
+      s->obj_size = cs_info.orig_size;
+      decompress.emplace(s->cct, &cs_info, partial_content, filter);
+      filter = &*decompress;
   }
-
   // for range requests with obj size 0
   if (range_str && !(s->obj_size)) {
     total_len = 0;
@@ -1442,6 +1450,7 @@ void RGWGetObj::execute()
     }
     return;
   }
+
   attr_iter = attrs.find(RGW_ATTR_SLO_MANIFEST);
   if (attr_iter != attrs.end() && !skip_manifest) {
     is_slo = true;
@@ -1462,6 +1471,21 @@ void RGWGetObj::execute()
   }
 
   start = ofs;
+
+  /* STAT ops don't need data, and do no i/o */
+  if (get_type() == RGW_OP_STAT_OBJ) {
+    return;
+  }
+
+  attr_iter = attrs.find(RGW_ATTR_MANIFEST);
+  op_ret = this->get_decrypt_filter(&decrypt, filter,
+                                    attr_iter != attrs.end() ? &(attr_iter->second) : nullptr);
+  if (decrypt != nullptr) {
+    filter = decrypt.get();
+  }
+  if (op_ret < 0) {
+    goto done_err;
+  }
 
   if (!get_data || ofs > end) {
     send_response_data(bl, 0, 0);
@@ -2027,7 +2051,7 @@ int RGWCreateBucket::verify_permission()
 
 static int forward_request_to_master(struct req_state *s, obj_version *objv,
 				    RGWRados *store, bufferlist& in_data,
-				    JSONParser *jp)
+				    JSONParser *jp, req_info *forward_info)
 {
   if (!store->rest_master_conn) {
     ldout(s->cct, 0) << "rest connection is invalid" << dendl;
@@ -2037,9 +2061,8 @@ static int forward_request_to_master(struct req_state *s, obj_version *objv,
   bufferlist response;
   string uid_str = s->user->user_id.to_str();
 #define MAX_REST_RESPONSE (128 * 1024) // we expect a very small response
-  int ret = store->rest_master_conn->forward(uid_str, s->info, objv,
-					    MAX_REST_RESPONSE, &in_data,
-					    &response);
+  int ret = store->rest_master_conn->forward(uid_str, (forward_info ? *forward_info : s->info),
+                                             objv, MAX_REST_RESPONSE, &in_data, &response);
   if (ret < 0)
     return ret;
 
@@ -2269,6 +2292,7 @@ void RGWCreateBucket::execute()
 
   RGWBucketInfo master_info;
   rgw_bucket *pmaster_bucket;
+  uint32_t *pmaster_num_shards;
   real_time creation_time;
 
   if (!store->is_meta_master()) {
@@ -2285,9 +2309,11 @@ void RGWCreateBucket::execute()
     ldout(s->cct, 20) << "got creation time: << " << master_info.creation_time << dendl;
     pmaster_bucket= &master_info.bucket;
     creation_time = master_info.creation_time;
+    pmaster_num_shards = &master_info.num_shards;
     pobjv = &objv;
   } else {
     pmaster_bucket = NULL;
+    pmaster_num_shards = NULL;
   }
 
   string zonegroup_id;
@@ -2308,7 +2334,7 @@ void RGWCreateBucket::execute()
     bucket.name = s->bucket_name;
     op_ret = store->select_bucket_placement(*(s->user), zonegroup_id,
 					    placement_rule,
-					    bucket, &selected_placement_rule, nullptr);
+					    &selected_placement_rule, nullptr);
     if (selected_placement_rule != s->bucket_info.placement_rule) {
       op_ret = -EEXIST;
       return;
@@ -2360,7 +2386,7 @@ void RGWCreateBucket::execute()
                                 placement_rule, s->bucket_info.swift_ver_location,
                                 pquota_info, attrs,
                                 info, pobjv, &ep_objv, creation_time,
-                                pmaster_bucket, true);
+                                pmaster_bucket, pmaster_num_shards, true);
   /* continue if EEXIST and create_bucket will fail below.  this way we can
    * recover from a partial create by retrying it. */
   ldout(s->cct, 20) << "rgw_create_bucket returned ret=" << op_ret << " bucket=" << s->bucket << dendl;
@@ -2582,25 +2608,9 @@ int RGWPutObj::verify_permission()
   return 0;
 }
 
-class RGWPutObjProcessor_Multipart : public RGWPutObjProcessor_Atomic
-{
-  string part_num;
-  RGWMPObj mp;
-  req_state *s;
-  string upload_id;
-
-protected:
-  int prepare(RGWRados *store, string *oid_rand) override;
-  int do_complete(size_t accounted_size, const string& etag, real_time *mtime,
-                  real_time set_mtime, map<string, bufferlist>& attrs,
-                  real_time delete_at, const char *if_match,
-                  const char *if_nomatch) override;
-
-public:
-  bool immutable_head() override { return true; }
-  RGWPutObjProcessor_Multipart(RGWObjectCtx& obj_ctx, RGWBucketInfo& bucket_info, uint64_t _p, req_state *_s) :
-                   RGWPutObjProcessor_Atomic(obj_ctx, bucket_info, _s->bucket, _s->object.name, _p, _s->req_id, false), s(_s) {}
-};
+void RGWPutObjProcessor_Multipart::get_mp(RGWMPObj** _mp){
+  *_mp = &mp;
+}
 
 int RGWPutObjProcessor_Multipart::prepare(RGWRados *store, string *oid_rand)
 {
@@ -2664,7 +2674,7 @@ int RGWPutObjProcessor_Multipart::do_complete(size_t accounted_size,
                                               map<string, bufferlist>& attrs,
                                               real_time delete_at,
                                               const char *if_match,
-                                              const char *if_nomatch)
+                                              const char *if_nomatch, const string *user_data)
 {
   complete_writing_data();
 
@@ -2789,9 +2799,10 @@ int RGWPutObj::get_data(const off_t fst, const off_t lst, bufferlist& bl)
   RGWPutObj_CB cb(this);
   RGWGetDataCB* filter = &cb;
   boost::optional<RGWGetObj_Decompress> decompress;
+  std::unique_ptr<RGWGetDataCB> decrypt;
   RGWCompressionInfo cs_info;
   map<string, bufferlist> attrs;
-
+  map<string, bufferlist>::iterator attr_iter;
   int ret = 0;
 
   uint64_t obj_size;
@@ -2825,6 +2836,18 @@ int RGWPutObj::get_data(const off_t fst, const off_t lst, bufferlist& bl)
     obj_size = cs_info.orig_size;
     decompress.emplace(s->cct, &cs_info, partial_content, filter);
     filter = &*decompress;
+  }
+
+  attr_iter = attrs.find(RGW_ATTR_MANIFEST);
+  op_ret = this->get_decrypt_filter(&decrypt,
+                                    filter,
+                                    attrs,
+                                    attr_iter != attrs.end() ? &(attr_iter->second) : nullptr);
+  if (decrypt != nullptr) {
+    filter = decrypt.get();
+  }
+  if (op_ret < 0) {
+    return ret;
   }
 
   ret = read_op.range_to_ofs(obj_size, new_ofs, new_end);
@@ -2868,7 +2891,8 @@ static CompressorRef get_compressor_plugin(const req_state *s,
 void RGWPutObj::execute()
 {
   RGWPutObjProcessor *processor = NULL;
-  RGWPutObjDataProcessor *filter = NULL;
+  RGWPutObjDataProcessor *filter = nullptr;
+  std::unique_ptr<RGWPutObjDataProcessor> encrypt;
   char supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1];
   char supplied_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
@@ -2887,7 +2911,6 @@ void RGWPutObj::execute()
   boost::optional<RGWPutObj_Compress> compressor;
 
   bool need_calc_md5 = (dlo_manifest == NULL) && (slo_info == NULL);
-
   perfcounter->inc(l_rgw_put);
   op_ret = -EINVAL;
   if (s->object.empty()) {
@@ -2969,14 +2992,24 @@ void RGWPutObj::execute()
 
   fst = copy_source_range_fst;
   lst = copy_source_range_lst;
-  if (compression_type != "none") {
-    plugin = get_compressor_plugin(s, compression_type);
-    if (!plugin) {
-      ldout(s->cct, 1) << "Cannot load plugin for compression type "
-          << compression_type << dendl;
-    } else {
-      compressor.emplace(s->cct, plugin, filter);
-      filter = &*compressor;
+
+  op_ret = get_encrypt_filter(&encrypt, filter);
+  if (op_ret < 0) {
+    goto done;
+  }
+  if (encrypt != nullptr) {
+    filter = encrypt.get();
+  } else {
+    //no encryption, we can try compression
+    if (compression_type != "none") {
+      plugin = get_compressor_plugin(s, compression_type);
+      if (!plugin) {
+        ldout(s->cct, 1) << "Cannot load plugin for compression type "
+            << compression_type << dendl;
+      } else {
+        compressor.emplace(s->cct, plugin, filter);
+        filter = &*compressor;
+      }
     }
   }
 
@@ -3001,7 +3034,7 @@ void RGWPutObj::execute()
     }
 
     bufferlist &data = data_in;
-    if (s->aws4_auth_streaming_mode) {
+    if (len && s->aws4_auth_streaming_mode) {
       /* use unwrapped data */
       data = s->aws4_auth->bl;
       len = data.length();
@@ -3032,7 +3065,7 @@ void RGWPutObj::execute()
 			  << op_ret << dendl;
         goto done;
       }
-
+      /* need_to_wait == true and op_ret == -EEXIST */
       ldout(s->cct, 5) << "NOTICE: processor->throttle_data() returned -EEXIST, need to restart write" << dendl;
 
       /* restore original data */
@@ -3042,7 +3075,6 @@ void RGWPutObj::execute()
 
       dispose_processor(processor);
       processor = select_processor(*static_cast<RGWObjectCtx *>(s->obj_ctx), &multipart);
-
       filter = processor;
 
       string oid_rand;
@@ -3057,11 +3089,18 @@ void RGWPutObj::execute()
         goto done;
       }
 
-      if (compressor) {
-        compressor.emplace(s->cct, plugin, filter);
-        filter = &*compressor;
+      op_ret = get_encrypt_filter(&encrypt, filter);
+      if (op_ret < 0) {
+        goto done;
       }
-
+      if (encrypt != nullptr) {
+        filter = encrypt.get();
+      } else {
+        if (compressor) {
+          compressor.emplace(s->cct, plugin, filter);
+          filter = &*compressor;
+        }
+      }
       op_ret = put_data_and_throttle(filter, data, ofs, false);
       if (op_ret < 0) {
         goto done;
@@ -3070,6 +3109,14 @@ void RGWPutObj::execute()
 
     ofs += len;
   } while (len > 0);
+
+  {
+    bufferlist flush;
+    op_ret = put_data_and_throttle(filter, flush, ofs, false);
+    if (op_ret < 0) {
+      goto done;
+    }
+  }
 
   if (!chunked_upload &&
       ofs != s->content_length &&
@@ -3181,7 +3228,8 @@ void RGWPutObj::execute()
   }
 
   op_ret = processor->complete(s->obj_size, etag, &mtime, real_time(), attrs,
-                               (delete_at ? *delete_at : real_time()), if_match, if_nomatch);
+                               (delete_at ? *delete_at : real_time()), if_match, if_nomatch,
+                               (user_data.empty() ? nullptr : &user_data));
 
   /* produce torrent */
   if (s->cct->_conf->rgw_torrent_flag && (ofs == torrent.get_data_len()))
@@ -3230,15 +3278,11 @@ void RGWPostObj::pre_exec()
 
 void RGWPostObj::execute()
 {
-  RGWPutObjDataProcessor *filter = NULL;
-  char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
-  unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  MD5 hash;
-  buffer::list bl, aclbl;
-  int len = 0;
+  RGWPutObjDataProcessor *filter = nullptr;
   boost::optional<RGWPutObj_Compress> compressor;
+  CompressorRef plugin;
 
-  // read in the data from the POST form
+  /* Read in the data from the POST form. */
   op_ret = get_params();
   if (op_ret < 0) {
     return;
@@ -3254,106 +3298,135 @@ void RGWPostObj::execute()
     return;
   }
 
-  op_ret = store->check_quota(s->bucket_owner.get_id(), s->bucket,
-			      user_quota, bucket_quota, s->content_length);
-  if (op_ret < 0) {
-    return;
-  }
+  /* Start iteration over data fields. It's necessary as Swift's FormPost
+   * is capable to handle multiple files in single form. */
+  do {
+    std::unique_ptr<RGWPutObjDataProcessor> encrypt;
+    char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
+    unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
+    MD5 hash;
+    ceph::buffer::list bl, aclbl;
+    int len = 0;
 
-  RGWPutObjProcessor_Atomic processor(*static_cast<RGWObjectCtx *>(s->obj_ctx),
-                                      s->bucket_info,
-                                      s->bucket,
-                                      s->object.name,
-                                      /* part size */
-                                      s->cct->_conf->rgw_obj_stripe_size,
-                                      s->req_id,
-                                      s->bucket_info.versioning_enabled());
-
-  // no filters by default
-  filter = &processor;
-
-  op_ret = processor.prepare(store, nullptr);
-  if (op_ret < 0)
-    return;
-
-  const auto& compression_type = store->get_zone_params().get_compression_type(
-      s->bucket_info.placement_rule);
-  CompressorRef plugin;
-  if (compression_type != "none") {
-    plugin = Compressor::create(s->cct, compression_type);
-    if (!plugin) {
-      ldout(s->cct, 1) << "Cannot load plugin for compression type "
-          << compression_type << dendl;
-    } else {
-      compressor.emplace(s->cct, plugin, filter);
-      filter = &*compressor;
+    op_ret = store->check_quota(s->bucket_owner.get_id(),
+                                s->bucket,
+                                user_quota,
+                                bucket_quota,
+                                s->content_length);
+    if (op_ret < 0) {
+      return;
     }
-  }
 
-  while (data_pending) {
-     bufferlist data;
-     len = get_data(data);
+    RGWPutObjProcessor_Atomic processor(*static_cast<RGWObjectCtx *>(s->obj_ctx),
+                                        s->bucket_info,
+                                        s->bucket,
+                                        get_current_filename(),
+                                        /* part size */
+                                        s->cct->_conf->rgw_obj_stripe_size,
+                                        s->req_id,
+                                        s->bucket_info.versioning_enabled());
+    /* No filters by default. */
+    filter = &processor;
 
-     if (len < 0) {
-       op_ret = len;
-       return;
-     }
+    op_ret = processor.prepare(store, nullptr);
+    if (op_ret < 0) {
+      return;
+    }
 
-     if (!len)
-       break;
+    op_ret = get_encrypt_filter(&encrypt, filter);
+    if (op_ret < 0) {
+      return;
+    }
+    if (encrypt != nullptr) {
+      filter = encrypt.get();
+    } else {
+      const auto& compression_type = store->get_zone_params().get_compression_type(
+          s->bucket_info.placement_rule);
+      if (compression_type != "none") {
+        plugin = Compressor::create(s->cct, compression_type);
+        if (!plugin) {
+          ldout(s->cct, 1) << "Cannot load plugin for compression type "
+                           << compression_type << dendl;
+        } else {
+          compressor.emplace(s->cct, plugin, filter);
+          filter = &*compressor;
+        }
+      }
+    }
 
-     hash.Update((const byte *)data.c_str(), data.length());
-     op_ret = put_data_and_throttle(filter, data, ofs, false);
+    bool again;
+    do {
+      ceph::bufferlist data;
+      len = get_data(data, again);
 
-     ofs += len;
+      if (len < 0) {
+        op_ret = len;
+        return;
+      }
 
-     if (ofs > max_len) {
-       op_ret = -ERR_TOO_LARGE;
-       return;
-     }
-   }
+      if (!len) {
+        break;
+      }
 
-  if (len < min_len) {
-    op_ret = -ERR_TOO_SMALL;
-    return;
-  }
+      hash.Update((const byte *)data.c_str(), data.length());
+      op_ret = put_data_and_throttle(filter, data, ofs, false);
 
-  s->obj_size = ofs;
+      ofs += len;
 
-  op_ret = store->check_quota(s->bucket_owner.get_id(), s->bucket,
-			      user_quota, bucket_quota, s->obj_size);
-  if (op_ret < 0) {
-    return;
-  }
+      if (ofs > max_len) {
+        op_ret = -ERR_TOO_LARGE;
+        return;
+      }
+    } while (again);
 
-  hash.Final(m);
-  buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
+    {
+      bufferlist flush;
+      op_ret = put_data_and_throttle(filter, flush, ofs, false);
+    }
 
-  etag = calc_md5;
-  bl.append(etag.c_str(), etag.size() + 1);
-  emplace_attr(RGW_ATTR_ETAG, std::move(bl));
+    if (len < min_len) {
+      op_ret = -ERR_TOO_SMALL;
+      return;
+    }
 
-  policy.encode(aclbl);
-  emplace_attr(RGW_ATTR_ACL, std::move(aclbl));
+    s->obj_size = ofs;
 
-  if (content_type.size()) {
-    bufferlist ct_bl;
-    ct_bl.append(content_type.c_str(), content_type.size() + 1);
-    emplace_attr(RGW_ATTR_CONTENT_TYPE, std::move(ct_bl));
-  }
+    op_ret = store->check_quota(s->bucket_owner.get_id(), s->bucket,
+                                user_quota, bucket_quota, s->obj_size);
+    if (op_ret < 0) {
+      return;
+    }
 
-  if (compressor && compressor->is_compressed()) {
-    bufferlist tmp;
-    RGWCompressionInfo cs_info;
-    cs_info.compression_type = plugin->get_type_name();
-    cs_info.orig_size = s->obj_size;
-    cs_info.blocks = move(compressor->get_compression_blocks());
-    ::encode(cs_info, tmp);
-    emplace_attr(RGW_ATTR_COMPRESSION, std::move(tmp));
-  }
+    hash.Final(m);
+    buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
 
-  op_ret = processor.complete(s->obj_size, etag, NULL, real_time(), attrs,
-                              (delete_at ? *delete_at : real_time()));
+    etag = calc_md5;
+    bl.append(etag.c_str(), etag.size() + 1);
+    emplace_attr(RGW_ATTR_ETAG, std::move(bl));
+
+    policy.encode(aclbl);
+    emplace_attr(RGW_ATTR_ACL, std::move(aclbl));
+
+    const std::string content_type = get_current_content_type();
+    if (! content_type.empty()) {
+      ceph::bufferlist ct_bl;
+      ct_bl.append(content_type.c_str(), content_type.size() + 1);
+      emplace_attr(RGW_ATTR_CONTENT_TYPE, std::move(ct_bl));
+    }
+
+    if (compressor && compressor->is_compressed()) {
+      ceph::bufferlist tmp;
+      RGWCompressionInfo cs_info;
+      cs_info.compression_type = plugin->get_type_name();
+      cs_info.orig_size = s->obj_size;
+      cs_info.blocks = move(compressor->get_compression_blocks());
+      ::encode(cs_info, tmp);
+      emplace_attr(RGW_ATTR_COMPRESSION, std::move(tmp));
+    }
+
+    op_ret = processor.complete(s->obj_size, etag, nullptr, real_time(),
+                                attrs, (delete_at ? *delete_at : real_time()));
+  } while (is_next_file_to_upload());
 }
 
 
@@ -3517,6 +3590,12 @@ void RGWPutMetadataBucket::execute()
    * the hood. This method will add the new items only if the map doesn't
    * contain such keys yet. */
   if (has_policy) {
+    if (s->dialect.compare("swift") == 0) {
+	auto old_policy = static_cast<RGWAccessControlPolicy_SWIFT*>(s->bucket_acl);
+	auto new_policy = static_cast<RGWAccessControlPolicy_SWIFT*>(&policy);
+	new_policy->filter_merge(policy_rw_mask, old_policy);
+	policy = *new_policy;
+    }
     buffer::list bl;
     policy.encode(bl);
     emplace_attr(RGW_ATTR_ACL, std::move(bl));
@@ -4575,7 +4654,7 @@ void RGWInitMultipart::execute()
 
   if (get_params() < 0)
     return;
-  op_ret = -EINVAL;
+
   if (s->object.empty())
     return;
 
@@ -4583,6 +4662,12 @@ void RGWInitMultipart::execute()
   attrs[RGW_ATTR_ACL] = aclbl;
 
   populate_with_generic_attrs(s, attrs);
+
+  /* select encryption mode */
+  op_ret = prepare_encryption(attrs);
+  if (op_ret != 0)
+    return;
+
   rgw_get_request_metadata(s->cct, s->info, attrs);
 
   do {
@@ -4690,7 +4775,6 @@ void RGWCompleteMultipart::execute()
   op_ret = get_params();
   if (op_ret < 0)
     return;
-
   op_ret = get_system_versioning_params(s, &olh_epoch, &version_id);
   if (op_ret < 0) {
     return;
@@ -4748,6 +4832,7 @@ void RGWCompleteMultipart::execute()
   meta_obj.index_hash_source = s->object.name;
 
   op_ret = get_obj_attrs(store, s, meta_obj, attrs);
+
   if (op_ret < 0) {
     ldout(s->cct, 0) << "ERROR: failed to get obj attrs, obj=" << meta_obj
 		     << " ret=" << op_ret << dendl;
@@ -5367,6 +5452,27 @@ RGWBulkUploadOp::parse_path(const boost::string_ref& path)
   return boost::none;
 }
 
+std::pair<std::string, std::string>
+RGWBulkUploadOp::handle_upload_path(struct req_state *s)
+{
+  std::string bucket_path, file_prefix;
+  if (! s->init_state.url_bucket.empty()) {
+    file_prefix = bucket_path = s->init_state.url_bucket + "/";
+    if (! s->object.empty()) {
+      std::string& object_name = s->object.name;
+
+      /* As rgw_obj_key::empty() already verified emptiness of s->object.name,
+       * we can safely examine its last element. */
+      if (object_name.back() == '/') {
+        file_prefix.append(object_name);
+      } else {
+        file_prefix.append(object_name).append("/");
+      }
+    }
+  }
+  return std::make_pair(bucket_path, file_prefix);
+}
+
 int RGWBulkUploadOp::handle_dir_verify_permission()
 {
   if (s->user->max_buckets > 0) {
@@ -5388,6 +5494,20 @@ int RGWBulkUploadOp::handle_dir_verify_permission()
   return 0;
 }
 
+static void forward_req_info(CephContext *cct, req_info& info, const std::string& bucket_name)
+{
+  /* the request of container or object level will contain bucket name.
+   * only at account level need to append the bucket name */
+  if (info.script_uri.find(bucket_name) != std::string::npos) {
+    return;
+  }
+
+  ldout(cct, 20) << "append the bucket: "<< bucket_name << " to req_info" << dendl;
+  info.script_uri.append("/").append(bucket_name);
+  info.request_uri_aws4 = info.request_uri = info.script_uri;
+  info.effective_uri = "/" + bucket_name;
+}
+
 int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
 {
   ldout(s->cct, 20) << "bulk upload: got directory=" << path << dendl;
@@ -5403,14 +5523,6 @@ int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
 
   rgw_raw_obj obj(store->get_zone_params().domain_root,
                   rgw_make_bucket_entry_name(s->bucket_tenant, bucket_name));
-
-  /* Swift API doesn't support location constraint. We're just checking here
-   * whether creation is taking place in the master zone or not. */
-  if (! store->get_zonegroup().is_master) {
-    ldout(s->cct, 0) << "creating bucket in a non-master zone." << dendl;
-    op_ret = -EINVAL;
-    return op_ret;
-  }
 
   /* we need to make sure we read bucket info, it's not read before for this
    * specific request */
@@ -5437,13 +5549,16 @@ int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
 
   RGWBucketInfo master_info;
   rgw_bucket *pmaster_bucket = nullptr;
+  uint32_t *pmaster_num_shards = nullptr;
   real_time creation_time;
   obj_version objv, ep_objv, *pobjv = nullptr;
 
   if (! store->is_meta_master()) {
     JSONParser jp;
     ceph::bufferlist in_data;
-    op_ret = forward_request_to_master(s, nullptr, store, in_data, &jp);
+    req_info info = s->info;
+    forward_req_info(s->cct, info, bucket_name);
+    op_ret = forward_request_to_master(s, nullptr, store, in_data, &jp, &info);
     if (op_ret < 0) {
       return op_ret;
     }
@@ -5459,9 +5574,11 @@ int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
 
     pmaster_bucket= &master_info.bucket;
     creation_time = master_info.creation_time;
+    pmaster_num_shards = &master_info.num_shards;
     pobjv = &objv;
   } else {
     pmaster_bucket = nullptr;
+    pmaster_num_shards = nullptr;
   }
 
 
@@ -5474,7 +5591,6 @@ int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
     op_ret = store->select_bucket_placement(*(s->user),
                                             store->get_zonegroup().get_id(),
                                             placement_rule,
-                                            bucket,
                                             &selected_placement_rule,
                                             nullptr);
     if (selected_placement_rule != binfo.placement_rule) {
@@ -5507,7 +5623,7 @@ int RGWBulkUploadOp::handle_dir(const boost::string_ref path)
                                 placement_rule, binfo.swift_ver_location,
                                 pquota_info, attrs,
                                 out_info, pobjv, &ep_objv, creation_time,
-                                pmaster_bucket, true);
+                                pmaster_bucket, pmaster_num_shards, true);
   /* continue if EEXIST and create_bucket will fail below.  this way we can
    * recover from a partial create by retrying it. */
   ldout(s->cct, 20) << "rgw_create_bucket returned ret=" << op_ret
@@ -5741,6 +5857,11 @@ void RGWBulkUploadOp::execute()
     return;
   }
 
+  /* Handling the $UPLOAD_PATH accordingly to the Swift's Bulk middleware. See: 
+   * https://github.com/openstack/swift/blob/2.13.0/swift/common/middleware/bulk.py#L31-L41 */
+  std::string bucket_path, file_prefix;
+  std::tie(bucket_path, file_prefix) = handle_upload_path(s);
+
   auto status = rgw::tar::StatusIndicator::create();
   do {
     op_ret = stream->get_exactly(rgw::tar::BLOCK_SIZE, buffer);
@@ -5765,25 +5886,28 @@ void RGWBulkUploadOp::execute()
         case rgw::tar::FileType::NORMAL_FILE: {
           ldout(s->cct, 2) << "bulk upload: handling regular file" << dendl;
 
+          boost::string_ref filename = bucket_path.empty() ? header->get_filename() : \
+                            file_prefix + header->get_filename().to_string();
           auto body = AlignedStreamGetter(0, header->get_filesize(),
                                           rgw::tar::BLOCK_SIZE, *stream);
-          op_ret = handle_file(header->get_filename(),
+          op_ret = handle_file(filename,
                                header->get_filesize(),
                                body);
           if (! op_ret) {
             /* Only regular files counts. */
             num_created++;
           } else {
-            failures.emplace_back(op_ret, header->get_filename().to_string());
+            failures.emplace_back(op_ret, filename.to_string());
           }
           break;
         }
         case rgw::tar::FileType::DIRECTORY: {
           ldout(s->cct, 2) << "bulk upload: handling regular directory" << dendl;
 
-          op_ret = handle_dir(header->get_filename());
+          boost::string_ref dirname = bucket_path.empty() ? header->get_filename() : bucket_path;
+          op_ret = handle_dir(dirname);
           if (op_ret < 0 && op_ret != -ERR_BUCKET_EXISTS) {
-            failures.emplace_back(op_ret, header->get_filename().to_string());
+            failures.emplace_back(op_ret, dirname.to_string());
           }
           break;
         }

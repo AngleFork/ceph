@@ -132,6 +132,8 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
        OpRequestRef op = OpRequestRef()
        ) = 0;
      virtual epoch_t get_epoch() const = 0;
+     virtual epoch_t get_interval_start_epoch() const = 0;
+     virtual epoch_t get_last_peering_reset_epoch() const = 0;
 
      virtual const set<pg_shard_t> &get_actingbackfill_shards() const = 0;
      virtual const set<pg_shard_t> &get_acting_shards() const = 0;
@@ -260,6 +262,10 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      virtual ceph_tid_t get_tid() = 0;
 
      virtual LogClientTemp clog_error() = 0;
+
+     virtual bool check_failsafe_full(ostream &ss) = 0;
+
+     virtual bool check_osdmap_full(const set<pg_shard_t> &missing_on) = 0;
 
      virtual ~Listener() {}
    };

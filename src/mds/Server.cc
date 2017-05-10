@@ -58,7 +58,6 @@
 #include "osd/OSDMap.h"
 
 #include <errno.h>
-#include <fcntl.h>
 
 #include <list>
 #include <iostream>
@@ -651,6 +650,13 @@ void Server::find_idle_sessions()
     return;
   }
 
+  if (mds->sessionmap.get_sessions().size() == 1 &&
+      mds->mdsmap->get_num_in_mds() == 1) {
+    dout(20) << "not evicting a slow client, because there is only one"
+             << dendl;
+    return;
+  }
+
   while (1) {
     Session *session = mds->sessionmap.get_oldest_session(Session::STATE_STALE);
     if (!session)
@@ -798,6 +804,7 @@ void Server::handle_client_reconnect(MClientReconnect *m)
 
   // notify client of success with an OPEN
   m->get_connection()->send_message(new MClientSession(CEPH_SESSION_OPEN));
+  session->last_cap_renew = ceph_clock_now();
   mds->clog->debug() << "reconnect by " << session->info.inst << " after " << delay;
   
   // snaprealms
@@ -2944,7 +2951,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
     return;
   }
   
-  bool need_auth = !file_mode_is_readonly(cmode) || (flags & O_TRUNC);
+  bool need_auth = !file_mode_is_readonly(cmode) || (flags & CEPH_O_TRUNC);
 
   if ((cmode & CEPH_FILE_MODE_WR) && mdcache->is_readonly()) {
     dout(7) << "read-only FS" << dendl;
@@ -2969,8 +2976,8 @@ void Server::handle_client_open(MDRequestRef& mdr)
     // can only open non-regular inode with mode FILE_MODE_PIN, at least for now.
     cmode = CEPH_FILE_MODE_PIN;
     // the inode is symlink and client wants to follow it, ignore the O_TRUNC flag.
-    if (cur->inode.is_symlink() && !(flags & O_NOFOLLOW))
-      flags &= ~O_TRUNC;
+    if (cur->inode.is_symlink() && !(flags & CEPH_O_NOFOLLOW))
+      flags &= ~CEPH_O_TRUNC;
   }
 
   dout(10) << "open flags = " << flags
@@ -2984,13 +2991,13 @@ void Server::handle_client_open(MDRequestRef& mdr)
     respond_to_request(mdr, -ENXIO);                 // FIXME what error do we want?
     return;
     }*/
-  if ((flags & O_DIRECTORY) && !cur->inode.is_dir() && !cur->inode.is_symlink()) {
+  if ((flags & CEPH_O_DIRECTORY) && !cur->inode.is_dir() && !cur->inode.is_symlink()) {
     dout(7) << "specified O_DIRECTORY on non-directory " << *cur << dendl;
     respond_to_request(mdr, -EINVAL);
     return;
   }
 
-  if ((flags & O_TRUNC) && !cur->inode.is_file()) {
+  if ((flags & CEPH_O_TRUNC) && !cur->inode.is_file()) {
     dout(7) << "specified O_TRUNC on !(file|symlink) " << *cur << dendl;
     // we should return -EISDIR for directory, return -EINVAL for other non-regular
     respond_to_request(mdr, cur->inode.is_dir() ? -EISDIR : -EINVAL);
@@ -3028,7 +3035,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
   }
 
   // O_TRUNC
-  if ((flags & O_TRUNC) && !mdr->has_completed) {
+  if ((flags & CEPH_O_TRUNC) && !mdr->has_completed) {
     assert(cur->is_auth());
 
     xlocks.insert(&cur->filelock);
@@ -3166,7 +3173,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
     return;
   }
 
-  if (!(req->head.args.open.flags & O_EXCL)) {
+  if (!(req->head.args.open.flags & CEPH_O_EXCL)) {
     int r = mdcache->path_traverse(mdr, NULL, NULL, req->get_filepath(),
 				   &mdr->dn[0], NULL, MDS_TRAVERSE_FORWARD);
     if (r > 0) return;
@@ -3189,7 +3196,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
     // r == -ENOENT
   }
 
-  bool excl = (req->head.args.open.flags & O_EXCL);
+  bool excl = (req->head.args.open.flags & CEPH_O_EXCL);
   set<SimpleLock*> rdlocks, wrlocks, xlocks;
   file_layout_t *dir_layout = NULL;
   CDentry *dn = rdlock_path_xlock_dentry(mdr, 0, rdlocks, wrlocks, xlocks,
@@ -3263,7 +3270,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
 
   if (!dnl->is_null()) {
     // it existed.  
-    assert(req->head.args.open.flags & O_EXCL);
+    assert(req->head.args.open.flags & CEPH_O_EXCL);
     dout(10) << "O_EXCL, target exists, failing with -EEXIST" << dendl;
     mdr->tracei = dnl->get_inode();
     mdr->tracedn = dn;
@@ -3364,12 +3371,15 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   frag_t fg = (__u32)req->head.args.readdir.frag;
   unsigned req_flags = (__u32)req->head.args.readdir.flags;
   string offset_str = req->get_path2();
-  dout(10) << " frag " << fg << " offset '" << offset_str << "'"
-	   << " flags " << req_flags << dendl;
 
   __u32 offset_hash = 0;
   if (!offset_str.empty())
     offset_hash = ceph_frag_value(diri->hash_dentry_name(offset_str));
+  else
+    offset_hash = (__u32)req->head.args.readdir.offset_hash;
+
+  dout(10) << " frag " << fg << " offset '" << offset_str << "'"
+	   << " offset_hash " << offset_hash << " flags " << req_flags << dendl;
 
   // does the frag exist?
   if (diri->dirfragtree[fg.value()] != fg) {
@@ -3427,7 +3437,8 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     max = dir->get_num_any();  // whatever, something big.
   unsigned max_bytes = req->head.args.readdir.max_bytes;
   if (!max_bytes)
-    max_bytes = 512 << 10;  // 512 KB?
+    // make sure at least one item can be encoded
+    max_bytes = (512 << 10) + g_conf->mds_max_xattr_pairs_size;
 
   // start final blob
   bufferlist dirbl;
@@ -3442,10 +3453,11 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   // build dir contents
   bufferlist dnbl;
   __u32 numfiles = 0;
+  bool start = !offset_hash && offset_str.empty();
   bool end = (dir->begin() == dir->end());
   // skip all dns < dentry_key_t(snapid, offset_str, offset_hash)
   dentry_key_t skip_key(snapid, offset_str.c_str(), offset_hash);
-  for (CDir::map_t::iterator it = offset_str.empty() ? dir->begin() : dir->lower_bound(skip_key);
+  for (CDir::map_t::iterator it = start ? dir->begin() : dir->lower_bound(skip_key);
        !end && numfiles < max;
        end = (it == dir->end())) {
     CDentry *dn = it->second;
@@ -3465,7 +3477,7 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
       continue;
     }
 
-    if (!offset_str.empty()) {
+    if (!start) {
       dentry_key_t offset_key(dn->last, offset_str.c_str(), offset_hash);
       if (!(offset_key < dn->key()))
 	continue;
@@ -3537,17 +3549,15 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     mdcache->lru.lru_touch(dn);
   }
   
-  bool complete = false;
   __u16 flags = 0;
   if (end) {
     flags = CEPH_READDIR_FRAG_END;
-    complete = offset_str.empty(); // FIXME: what purpose does this serve
-    if (complete)
-      flags |= CEPH_READDIR_FRAG_COMPLETE;
+    if (start)
+      flags |= CEPH_READDIR_FRAG_COMPLETE; // FIXME: what purpose does this serve
   }
   // client only understand END and COMPLETE flags ?
   if (req_flags & CEPH_READDIR_REPLY_BITFLAGS) {
-    flags |= CEPH_READDIR_HASH_ORDER;
+    flags |= CEPH_READDIR_HASH_ORDER | CEPH_READDIR_OFFSET_HASH;
   }
   
   // finish final blob
@@ -3558,8 +3568,8 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   // yay, reply
   dout(10) << "reply to " << *req << " readdir num=" << numfiles
 	   << " bytes=" << dirbl.length()
+	   << " start=" << (int)start
 	   << " end=" << (int)end
-	   << " complete=" << (int)complete
 	   << dendl;
   mdr->reply_extra_bl = dirbl;
 
@@ -4412,6 +4422,8 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
     return;
   }
 
+  pi->change_attr++;
+  pi->ctime = mdr->get_op_stamp();
   pi->version = cur->pre_dirty();
   if (cur->is_file())
     pi->update_backtrace();
@@ -4542,6 +4554,25 @@ void Server::handle_client_setxattr(MDRequestRef& mdr)
     return;
 
   map<string, bufferptr> *pxattrs = cur->get_projected_xattrs();
+  size_t len = req->get_data().length();
+  size_t inc = len + name.length();
+
+  // check xattrs kv pairs size
+  size_t cur_xattrs_size = 0;
+  for (const auto& p : *pxattrs) {
+    if ((flags & CEPH_XATTR_REPLACE) && (name.compare(p.first) == 0)) {
+      continue;
+    }
+    cur_xattrs_size += p.first.length() + p.second.length();
+  }
+
+  if (((cur_xattrs_size + inc) > g_conf->mds_max_xattr_pairs_size)) {
+    dout(10) << "xattr kv pairs size too big. cur_xattrs_size " 
+             << cur_xattrs_size << ", inc " << inc << dendl;
+    respond_to_request(mdr, -ENOSPC);
+    return;
+  }
+
   if ((flags & CEPH_XATTR_CREATE) && pxattrs->count(name)) {
     dout(10) << "setxattr '" << name << "' XATTR_CREATE and EEXIST on " << *cur << dendl;
     respond_to_request(mdr, -EEXIST);
@@ -4553,7 +4584,6 @@ void Server::handle_client_setxattr(MDRequestRef& mdr)
     return;
   }
 
-  int len = req->get_data().length();
   dout(10) << "setxattr '" << name << "' len " << len << " on " << *cur << dendl;
 
   // project update
@@ -7116,20 +7146,6 @@ void Server::_rename_apply(MDRequestRef& mdr, CDentry *srcdn, CDentry *destdn, C
     }
   }
 
-  if (srcdn->get_dir()->inode->is_stray() &&
-      srcdn->get_dir()->inode->get_stray_owner() == mds->get_nodeid()) {
-    // A reintegration event or a migration away from me
-    dout(20) << __func__ << ": src dentry was a stray, updating stats" << dendl;
-    mdcache->notify_stray_removed();
-  }
-
-  if (destdn->get_dir()->inode->is_stray() &&
-      destdn->get_dir()->inode->get_stray_owner() == mds->get_nodeid()) {
-    // A stray migration (to me)
-    dout(20) << __func__ << ": dst dentry was a stray, updating stats" << dendl;
-    mdcache->notify_stray_created();
-  }
-
   // src
   if (srcdn->is_auth())
     srcdn->mark_dirty(mdr->more()->pvmap[srcdn], mdr->ls);
@@ -8055,7 +8071,8 @@ void Server::handle_client_lssnap(MDRequestRef& mdr)
     max_entries = infomap.size();
   int max_bytes = req->head.args.readdir.max_bytes;
   if (!max_bytes)
-    max_bytes = 512 << 10;
+    // make sure at least one item can be encoded
+    max_bytes = (512 << 10) + g_conf->mds_max_xattr_pairs_size;
 
   __u64 last_snapid = 0;
   string offset_str = req->get_path2();

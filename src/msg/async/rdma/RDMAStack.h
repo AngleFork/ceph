@@ -40,6 +40,7 @@ enum {
 
   l_msgr_rdma_polling,
   l_msgr_rdma_inflight_tx_chunks,
+  l_msgr_rdma_inqueue_rx_chunks,
 
   l_msgr_rdma_tx_total_wc,
   l_msgr_rdma_tx_total_wc_errors,
@@ -62,7 +63,7 @@ enum {
 };
 
 
-class RDMADispatcher : public CephContext::ForkWatcher {
+class RDMADispatcher {
   typedef Infiniband::MemoryManager::Chunk Chunk;
   typedef Infiniband::QueuePair QueuePair;
 
@@ -125,8 +126,6 @@ class RDMADispatcher : public CephContext::ForkWatcher {
   void erase_qpn_lockless(uint32_t qpn);
   void erase_qpn(uint32_t qpn);
   void notify_pending_workers();
-  virtual void handle_pre_fork() override;
-  virtual void handle_post_fork() override;
   void handle_tx_event(Device *ibdev, ibv_wc *cqe, int n);
   void post_tx_buffer(Device *ibdev, std::vector<Chunk*> &chunks);
 
@@ -197,6 +196,8 @@ class RDMAStack : public NetworkStack {
   RDMADispatcher *dispatcher;
   PerfCounters *perf_counter;
 
+  std::atomic<bool> fork_finished = {false};
+
  public:
   explicit RDMAStack(CephContext *cct, const string &t);
   virtual ~RDMAStack();
@@ -206,5 +207,8 @@ class RDMAStack : public NetworkStack {
   virtual void spawn_worker(unsigned i, std::function<void ()> &&func) override;
   virtual void join_worker(unsigned i) override;
   RDMADispatcher *get_dispatcher() { return dispatcher; }
+
+  virtual bool is_ready() override { return fork_finished.load(); };
+  virtual void ready() override { fork_finished = true; };
 };
 #endif

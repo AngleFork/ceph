@@ -165,6 +165,39 @@ Building from source
 
 See instructions at :doc:`/install/build-ceph`.
 
+Using ccache to speed up local builds
+-------------------------------------
+
+Rebuilds of the ceph source tree can benefit significantly from use of `ccache`_.
+Many a times while switching branches and such, one might see build failures for
+certain older branches mostly due to older build artifacts. These rebuilds can
+significantly benefit the use of ccache. For a full clean source tree, one could
+do ::
+
+  $ make clean
+
+  # note the following will nuke everything in the source tree that
+  # isn't tracked by git, so make sure to backup any log files /conf options
+
+  $ git clean -fdx; git submodule foreach git clean -fdx
+
+ccache is available as a package in most distros. To build ceph with ccache one
+can::
+
+  $ cmake -DWITH_CCACHE=ON ..
+
+ccache can also be used for speeding up all builds in the system. for more
+details refer to the `run modes`_ of the ccache manual. The default settings of
+``ccache`` can be displayed with ``ccache -s``.
+
+.. note: It is recommended to override the ``max_size``, which is the size of
+   cache, defaulting to 10G, to a larger size like 25G or so. Refer to the
+   `configuration`_ section of ccache manual.
+
+.. _`ccache`: https://ccache.samba.org/
+.. _`run modes`: https://ccache.samba.org/manual.html#_run_modes
+.. _`configuration`: https://ccache.samba.org/manual.html#_configuration
+
 Development-mode cluster
 ------------------------
 
@@ -1154,8 +1187,8 @@ proceed to the next step.
 To start with a clean slate, login to your tenant via the Horizon dashboard and:
 
 * terminate the ``teuthology`` and ``packages-repository`` instances, if any
-* delete the ``teuthology`` security group
-* delete the ``teuthology`` and ``teuthology-myself`` key pairs
+* delete the ``teuthology`` and ``teuthology-worker`` security groups, if any
+* delete the ``teuthology`` and ``teuthology-myself`` key pairs, if any
 
 Also do the above if you ever get key-related errors ("invalid key", etc.) when
 trying to schedule suites.
@@ -1384,6 +1417,97 @@ The IP addresses of the target machines can be found by running ``openstack
 server list`` on the teuthology machine, but the target VM hostnames (e.g.
 ``target149202171058.teuthology``) are resolvable within the teuthology
 cluster.
+
+
+Testing - how to run s3-tests locally
+=====================================
+
+RGW code can be tested by building Ceph locally from source, starting a vstart
+cluster, and running the "s3-tests" suite against it.
+
+The following instructions should work on jewel and above.
+
+Step 1 - build Ceph
+-------------------
+
+Refer to :doc:`install/build-ceph`.
+
+You can do step 2 separately while it is building.
+
+Step 2 - s3-tests
+-----------------
+
+The test suite is in a separate git repo, and is written in python. Perform the
+following steps for jewel::
+
+    git clone git://github.com/ceph/s3-tests
+    cd s3-tests
+    git checkout ceph-jewel
+    ./bootstrap
+
+For kraken, checkout the ``ceph-kraken`` branch instead of ``ceph-jewel``. For
+master, use ``ceph-master``.
+
+Step 3 - vstart
+---------------
+
+When the build completes, and still in the top-level directory of the git
+clone where you built Ceph, do the following::
+
+    cd src/
+    ./vstart.sh -n -r --mds_num 0
+
+This will produce a lot of output as the vstart cluster is started up. At the
+end you should see a message like::
+
+    started.  stop.sh to stop.  see out/* (e.g. 'tail -f out/????') for debug output.
+
+This means the cluster is running.
+
+Step 4 - prepare S3 environment
+-------------------------------
+
+The s3-tests suite expects to run in a particular environment (S3 users, keys,
+configuration file).
+
+Before you try to prepare the environment, make sure you don't have any
+existing keyring or ``ceph.conf`` files in ``/etc/ceph``.
+
+For jewel, Abhishek Lekshmanan wrote a script that can be used for this
+purpose. Assuming you are testing jewel, run the following commands from the
+``src/`` directory of your ceph clone (where you just started the vstart
+cluster)::
+
+    pushd ~
+    wget https://gist.githubusercontent.com/theanalyst/2fee6bc2780f67c79cad7802040fcddc/raw/b497ddba053d9a6fb5d91b73924cbafcfc32f137/s3tests-bootstrap.sh
+    popd
+    sh ~/s3tests-bootstrap.sh
+
+If the script is successful, it will display a blob of JSON and create a file
+called ``s3.conf`` in the current directory.
+
+Step 5 - run s3-tests
+---------------------
+
+To actually run the tests, take note of the full path to the ``s3.conf`` file
+created in the previous step and then move to the directory where you cloned
+``s3-tests`` in Step 2.
+
+First, verify that the test suite is there and can be run::
+
+    S3TEST_CONF=/path/to/s3.conf ./virtualenv/bin/nosetests -a '!fails_on_rgw' -v --collect-only
+
+This should complete quickly - it is like a "dry run" of all the tests in the
+suite.
+
+Finally, run the test suite itself::
+
+    S3TEST_CONF=/path/to/s3.conf ./virtualenv/bin/nosetests -a '!fails_on_rgw' -v
+
+Note: the following test is expected to error - this is a problem in the test
+setup (WIP), not an actual test failure::
+
+    ERROR: s3tests.functional.test_s3.test_bucket_acl_grant_email
 
 
 .. WIP

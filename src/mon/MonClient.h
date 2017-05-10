@@ -194,6 +194,7 @@ private:
   uint64_t global_id = 0;
   Cond auth_cond;
   int authenticate_err = 0;
+  bool authenticated = false;
 
   list<Message*> waiting_for_session;
   utime_t last_rotating_renew_sent;
@@ -219,6 +220,7 @@ public:
   int wait_auth_rotating(double timeout);
 
   int authenticate(double timeout=0.0);
+  bool is_authenticated() const {return authenticated;}
 
   /**
    * Try to flush as many log messages as we can in a single
@@ -466,15 +468,10 @@ public:
    * to the MonMap
    */
   template<typename Callback, typename...Args>
-  auto with_monmap(Callback&& cb, Args&&...args) ->
-    typename std::enable_if<
-      std::is_void<
-    decltype(cb(const_cast<const MonMap&>(monmap),
-		std::forward<Args>(args)...))>::value,
-      void>::type {
+  auto with_monmap(Callback&& cb, Args&&...args) const ->
+    decltype(cb(monmap, std::forward<Args>(args)...)) {
     Mutex::Locker l(monc_lock);
-    std::forward<Callback>(cb)(const_cast<const MonMap&>(monmap),
-			       std::forward<Args>(args)...);
+    return std::forward<Callback>(cb)(monmap, std::forward<Args>(args)...);
   }
 
 private:

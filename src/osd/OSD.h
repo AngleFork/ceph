@@ -25,6 +25,7 @@
 #include "common/WorkQueue.h"
 #include "common/AsyncReserver.h"
 #include "common/ceph_context.h"
+#include "common/zipkin_trace.h"
 
 #include "mgr/MgrClient.h"
 
@@ -202,6 +203,7 @@ enum {
   rs_down_latency,
   rs_getmissing_latency,
   rs_waitupthru_latency,
+  rs_notrecovering_latency,
   rs_last,
 };
 
@@ -470,7 +472,6 @@ public:
   MonClient   *&monc;
   ThreadPool::BatchWorkQueue<PG> &peering_wq;
   GenContextWQ recovery_gen_wq;
-  GenContextWQ op_gen_wq;
   ClassHandler  *&class_handler;
 
   void enqueue_back(spg_t pgid, PGQueueable qi);
@@ -917,9 +918,9 @@ public:
     return (((uint64_t)cur_epoch) << 32) | ((uint64_t)(next_notif_id++));
   }
 
-  // -- Backfill Request Scheduling --
-  Mutex backfill_request_lock;
-  SafeTimer backfill_request_timer;
+  // -- Recovery/Backfill Request Scheduling --
+  Mutex recovery_request_lock;
+  SafeTimer recovery_request_timer;
 
   // -- tids --
   // for ops i issue
@@ -961,7 +962,7 @@ public:
       PGQueueable(
 	PGScrub(pg->get_osdmap()->get_epoch()),
 	cct->_conf->osd_scrub_cost,
-	pg->get_scrub_priority(),
+	pg->scrubber.priority,
 	ceph_clock_now(),
 	entity_inst_t(),
 	pg->get_osdmap()->get_epoch()));
@@ -1025,7 +1026,7 @@ public:
     Mutex::Locker l(recovery_lock);
     _maybe_queue_recovery();
   }
-  void clear_queued_recovery(PG *pg, bool front = false) {
+  void clear_queued_recovery(PG *pg) {
     Mutex::Locker l(recovery_lock);
     for (list<pair<epoch_t, PGRef> >::iterator i = awaiting_throttle.begin();
 	 i != awaiting_throttle.end();
@@ -1137,26 +1138,51 @@ public:
 
   // -- OSD Full Status --
 private:
-  Mutex full_status_lock;
-  enum s_names { NONE, NEARFULL, FULL, FAILSAFE } cur_state;  // ascending
-  const char *get_full_state_name(s_names s) {
+  friend TestOpsSocketHook;
+  mutable Mutex full_status_lock;
+  enum s_names { INVALID = -1, NONE, NEARFULL, BACKFILLFULL, FULL, FAILSAFE } cur_state;  // ascending
+  const char *get_full_state_name(s_names s) const {
     switch (s) {
     case NONE: return "none";
     case NEARFULL: return "nearfull";
+    case BACKFILLFULL: return "backfillfull";
     case FULL: return "full";
     case FAILSAFE: return "failsafe";
     default: return "???";
     }
   }
+  s_names get_full_state(string type) const {
+    if (type == "none")
+      return NONE;
+    else if (type == "failsafe")
+      return FAILSAFE;
+    else if (type == "full")
+      return FULL;
+    else if (type == "backfillfull")
+      return BACKFILLFULL;
+    else if (type == "nearfull")
+      return NEARFULL;
+    else
+      return INVALID;
+  }
   double cur_ratio;  ///< current utilization
+  mutable int64_t injectfull = 0;
+  s_names injectfull_state = NONE;
   float get_failsafe_full_ratio();
   void check_full_status(const osd_stat_t &stat);
+  bool _check_full(s_names type, ostream &ss) const;
 public:
-  bool check_failsafe_full();
-  bool is_nearfull();
-  bool is_full();
-  bool too_full_for_backfill(double *ratio, double *max_ratio);
+  bool check_failsafe_full(ostream &ss) const;
+  bool check_full(ostream &ss) const;
+  bool check_backfill_full(ostream &ss) const;
+  bool check_nearfull(ostream &ss) const;
+  bool is_failsafe_full() const;
+  bool is_full() const;
+  bool is_backfillfull() const;
+  bool is_nearfull() const;
   bool need_fullness_update();  ///< osdmap state needs update
+  void set_injectfull(s_names type, int64_t count);
+  bool check_osdmap_full(const set<pg_shard_t> &missing_on);
 
 
   // -- epochs --
@@ -1295,6 +1321,7 @@ protected:
   int whoami;
   std::string dev_path, journal_path;
 
+  ZTracer::Endpoint trace_endpoint;
   void create_logger();
   void create_recoverystate_perf();
   void tick();
@@ -2024,7 +2051,7 @@ protected:
     vector<int>& up, int up_primary,
     vector<int>& acting, int acting_primary,
     pg_history_t history,
-    const pg_interval_map_t& pi,
+    const PastIntervals& pi,
     ObjectStore::Transaction& t);
 
   PG* _make_pg(OSDMapRef createmap, spg_t pgid);
@@ -2034,12 +2061,20 @@ protected:
   int handle_pg_peering_evt(
     spg_t pgid,
     const pg_history_t& orig_history,
-    const pg_interval_map_t& pi,
+    const PastIntervals& pi,
     epoch_t epoch,
     PG::CephPeeringEvtRef evt);
   
   void load_pgs();
   void build_past_intervals_parallel();
+
+  /// build initial pg history and intervals on create
+  void build_initial_pg_history(
+    spg_t pgid,
+    epoch_t created,
+    utime_t created_stamp,
+    pg_history_t *h,
+    PastIntervals *pi);
 
   /// project pg history from from to now
   bool project_pg_history(
@@ -2134,6 +2169,10 @@ protected:
   void flush_pg_stats();
 
   ceph::coarse_mono_clock::time_point last_sent_beacon;
+  Mutex min_last_epoch_clean_lock{"OSD::min_last_epoch_clean_lock"};
+  epoch_t min_last_epoch_clean = 0;
+  // which pgs were scanned for min_lec
+  std::vector<pg_t> min_last_epoch_clean_pgs;
   void send_beacon(const ceph::coarse_mono_clock::time_point& now);
 
   void pg_stat_queue_enqueue(PG *pg) {
@@ -2172,13 +2211,13 @@ protected:
   void dispatch_context_transaction(PG::RecoveryCtx &ctx, PG *pg,
                                     ThreadPool::TPHandle *handle = NULL);
   void do_notifies(map<int,
-		       vector<pair<pg_notify_t, pg_interval_map_t> > >&
+		       vector<pair<pg_notify_t, PastIntervals> > >&
 		       notify_list,
 		   OSDMapRef map);
   void do_queries(map<int, map<spg_t,pg_query_t> >& query_map,
 		  OSDMapRef map);
   void do_infos(map<int,
-		    vector<pair<pg_notify_t, pg_interval_map_t> > >& info_map,
+		    vector<pair<pg_notify_t, PastIntervals> > >& info_map,
 		OSDMapRef map);
 
   bool require_mon_peer(const Message *m);
@@ -2414,6 +2453,8 @@ protected:
   }
 
 private:
+  int mon_cmd_maybe_osd_create(string &cmd);
+  int update_crush_device_class();
   int update_crush_location();
 
   static int write_meta(ObjectStore *store,

@@ -17,6 +17,7 @@
 #include "rgw_keystone.h"
 #include "rgw_rest_conn.h"
 #include "rgw_ldap.h"
+#include "rgw_rest.h"
 
 #include "rgw_token.h"
 #include "include/assert.h"
@@ -34,6 +35,7 @@ protected:
   // Serving a custom error page from an object is really a 200 response with
   // just the status line altered.
   int custom_http_ret = 0;
+  std::map<std::string, std::string> crypt_http_responses;
 public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() override {}
@@ -42,6 +44,9 @@ public:
   int send_response_data_error() override;
   int send_response_data(bufferlist& bl, off_t ofs, off_t len) override;
   void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
+  int get_decrypt_filter(std::unique_ptr<RGWGetDataCB>* filter,
+                         RGWGetDataCB* cb,
+                         bufferlist* manifest_bl) override;
 };
 
 class RGWListBuckets_ObjStore_S3 : public RGWListBuckets_ObjStore {
@@ -164,6 +169,9 @@ public:
 };
 
 class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
+private:
+  std::map<std::string, std::string> crypt_http_responses;
+
 public:
   RGWPutObj_ObjStore_S3() {}
   ~RGWPutObj_ObjStore_S3() override {}
@@ -178,47 +186,31 @@ public:
                                  string chunk_signature);
   int validate_and_unwrap_available_aws4_chunked_data(bufferlist& bl_in,
                                                       bufferlist& bl_out);
-};
 
-struct post_part_field {
-  string val;
-  map<string, string> params;
-};
-
-struct post_form_part {
-  string name;
-  string content_type;
-  map<string, struct post_part_field, ltstr_nocase> fields;
-  bufferlist data;
+  int get_encrypt_filter(std::unique_ptr<RGWPutObjDataProcessor>* filter,
+                         RGWPutObjDataProcessor* cb) override;
+  int get_decrypt_filter(std::unique_ptr<RGWGetDataCB>* filter,
+                         RGWGetDataCB* cb,
+                         map<string, bufferlist>& attrs,
+                         bufferlist* manifest_bl) override;
 };
 
 class RGWPostObj_ObjStore_S3 : public RGWPostObj_ObjStore {
-  string boundary;
-  string filename;
-  bufferlist in_data;
-  map<string, post_form_part, const ltstr_nocase> parts;  
+  parts_collection_t parts;
+  std::string filename;
+  std::string content_type;
   RGWPolicyEnv env;
   RGWPolicy post_policy;
-  string err_msg;
+  map<string, string> crypt_http_responses;
 
   const rgw::auth::StrategyRegistry* auth_registry_ptr = nullptr;
 
-  int read_with_boundary(bufferlist& bl, uint64_t max, bool check_eol,
-                         bool *reached_boundary,
-			 bool *done);
-
-  int read_line(bufferlist& bl, uint64_t max,
-                bool *reached_boundary, bool *done);
-
-  int read_data(bufferlist& bl, uint64_t max, bool *reached_boundary, bool *done);
-
-  int read_form_part_header(struct post_form_part *part,
-                            bool *done);
-  bool part_str(const string& name, string *val);
-  bool part_bl(const string& name, bufferlist *pbl);
-
   int get_policy();
   void rebuild_key(string& key);
+
+  std::string get_current_filename() const override;
+  std::string get_current_content_type() const override;
+
 public:
   RGWPostObj_ObjStore_S3() {}
   ~RGWPostObj_ObjStore_S3() override {}
@@ -230,8 +222,11 @@ public:
 
   int get_params() override;
   int complete_get_params();
+
   void send_response() override;
-  int get_data(bufferlist& bl) override;
+  int get_data(ceph::bufferlist& bl, bool& again) override;
+  int get_encrypt_filter(std::unique_ptr<RGWPutObjDataProcessor>* filter,
+                         RGWPutObjDataProcessor* cb) override;
 };
 
 class RGWDeleteObj_ObjStore_S3 : public RGWDeleteObj_ObjStore {
@@ -351,12 +346,15 @@ public:
 };
 
 class RGWInitMultipart_ObjStore_S3 : public RGWInitMultipart_ObjStore {
+private:
+  std::map<std::string, std::string> crypt_http_responses;
 public:
   RGWInitMultipart_ObjStore_S3() {}
   ~RGWInitMultipart_ObjStore_S3() override {}
 
   int get_params() override;
   void send_response() override;
+  int prepare_encryption(map<string, bufferlist>& attrs) override;
 };
 
 class RGWCompleteMultipart_ObjStore_S3 : public RGWCompleteMultipart_ObjStore {
